@@ -241,8 +241,8 @@ class AIService:
                 self.logger.info(f"Returning cached analysis for meal plan {meal_plan.id}")
                 return cached_result
             
-            # Prepare meal plan data for analysis
-            meal_plan_data = self._prepare_meal_plan_for_analysis(meal_plan)
+            # Prepare meal plan data for analysis (using sync_to_async)
+            meal_plan_data = await asyncio.to_thread(self._prepare_meal_plan_for_analysis, meal_plan)
             
             # Build the prompt for meal plan analysis
             prompt = self._build_meal_plan_analysis_prompt(plan_description, meal_plan_data)
@@ -253,7 +253,8 @@ class AIService:
             # Parse the JSON response
             analysis_data = self._parse_analysis_response(response_text)
             
-            total_recipes = meal_plan.items.count()
+            # Get total recipes count using sync_to_async
+            total_recipes = await asyncio.to_thread(lambda: meal_plan.items.count())
             
             analysis = {
                 'meal_plan_id': str(meal_plan.id),
@@ -549,7 +550,11 @@ class AIService:
             
             # Group meal plan items by day
             items_by_day = {}
-            for item in meal_plan.items.all():
+            
+            # Use select_related to avoid additional queries
+            meal_plan_items = meal_plan.items.select_related('recipe').all()
+            
+            for item in meal_plan_items:
                 day_name = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][item.day_of_week]
                 if day_name not in items_by_day:
                     items_by_day[day_name] = {'breakfast': [], 'lunch': [], 'dinner': []}
