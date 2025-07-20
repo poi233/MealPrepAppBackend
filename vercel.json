@@ -2,6 +2,14 @@
   "version": 2,
   "builds": [
     {
+      "src": "api/index.py",
+      "use": "@vercel/python"
+    },
+    {
+      "src": "api/favicon.py",
+      "use": "@vercel/python"
+    },
+    {
       "src": "api/wsgi.py",
       "use": "@vercel/python",
       "config": {
@@ -11,8 +19,32 @@
   ],
   "routes": [
     {
+      "src": "/favicon.ico",
+      "dest": "api/favicon.py"
+    },
+    {
+      "src": "/favicon.png",
+      "dest": "api/favicon.py"
+    },
+    {
       "src": "/static/(.*)",
       "dest": "/static/$1"
+    },
+    {
+      "src": "/media/(.*)",
+      "dest": "/media/$1"
+    },
+    {
+      "src": "/",
+      "dest": "api/index.py"
+    },
+    {
+      "src": "/api/(.*)",
+      "dest": "api/wsgi.py"
+    },
+    {
+      "src": "/admin/(.*)",
+      "dest": "api/wsgi.py"
     },
     {
       "src": "/(.*)",
