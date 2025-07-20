@@ -25,8 +25,47 @@ CSRF_COOKIE_SECURE = True
 X_FRAME_OPTIONS = 'DENY'
 
 # Production CORS settings
-CORS_ALLOWED_ORIGINS = config('CORS_ALLOWED_ORIGINS', default='').split(',')
+cors_origins = config('CORS_ALLOWED_ORIGINS', default='').split(',')
+# Filter out empty strings
+CORS_ALLOWED_ORIGINS = [origin.strip() for origin in cors_origins if origin.strip()]
+
+# If no CORS origins are configured, allow common Vercel patterns
+if not CORS_ALLOWED_ORIGINS:
+    CORS_ALLOWED_ORIGINS = [
+        "https://mealsuggestpoi.zapto.org",
+        "https://meal-prep-pubbzexdt-pois-projects-1cbc0dc1.vercel.app",
+        "https://meal-prep-ai-git-master-pois-projects-1cbc0dc1.vercel.app",
+    ]
+
+# Also allow all Vercel app domains for this project
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://meal-prep-.*\.vercel\.app$",
+    r"^https://.*-pois-projects-1cbc0dc1\.vercel\.app$",
+    r"^https://mealsuggestpoi\.zapto\.org$",
+]
+
+# Additional CORS settings for production
 CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOWED_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+]
+CORS_ALLOWED_METHODS = [
+    'DELETE',
+    'GET',
+    'OPTIONS',
+    'PATCH',
+    'POST',
+    'PUT',
+]
 
 # Database connection pooling for production
 DATABASES['default'].update({
@@ -87,21 +126,13 @@ LOGGING = {
 # Static files handling with WhiteNoise
 STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
-# Cache for production (use dummy cache for Vercel, Redis for other deployments)
-REDIS_URL = config('REDIS_URL', default='')
-if REDIS_URL:
-    CACHES = {
-        'default': {
-            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
-            'LOCATION': REDIS_URL,
-        }
+# Cache for production (use dummy cache for Vercel)
+# Vercel doesn't support persistent Redis, so we use dummy cache
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.dummy.DummyCache',
     }
-else:
-    CACHES = {
-        'default': {
-            'BACKEND': 'django.core.cache.backends.dummy.DummyCache',
-        }
-    }
+}
 
 # Rate limiting
 RATELIMIT_ENABLE = True
