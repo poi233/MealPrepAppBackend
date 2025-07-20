@@ -1,0 +1,2 @@
+# Reference to main requirements
+-r ../requirements.txt

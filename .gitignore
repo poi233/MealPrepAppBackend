@@ -80,7 +80,7 @@ celerybeat-schedule
 *.sage.py
 
 # Environments
-.env
+.env*
 .venv
 env/
 venv/
@@ -117,3 +117,4 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+.vercel
