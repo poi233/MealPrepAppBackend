@@ -82,11 +82,51 @@ class NutritionInfoSerializer(serializers.Serializer):
 
 class RecipeSerializer(serializers.ModelSerializer):
     """Serializer for Recipe model with ingredient and nutrition info handling."""
-    ingredients = IngredientSerializer(many=True)
-    nutrition_info = NutritionInfoSerializer(required=False)
+    ingredients = serializers.SerializerMethodField()
+    nutrition_info = serializers.SerializerMethodField()
     created_by_user = serializers.StringRelatedField(read_only=True)
     created_by_user_id = serializers.UUIDField(source='created_by_user.id', read_only=True)
     total_time = serializers.SerializerMethodField()
+
+    def get_ingredients(self, obj):
+        """Handle ingredients field - can be strings or objects."""
+        if not obj.ingredients:
+            return []
+        
+        # If ingredients is already a list of objects with proper structure, return as is
+        if isinstance(obj.ingredients, list) and obj.ingredients:
+            first_ingredient = obj.ingredients[0]
+            if isinstance(first_ingredient, dict) and 'name' in first_ingredient:
+                return obj.ingredients
+            elif isinstance(first_ingredient, str):
+                # Convert string ingredients to object format
+                return [{'name': ingredient, 'amount': 1, 'unit': 'piece', 'notes': ''} 
+                       for ingredient in obj.ingredients]
+        
+        # Fallback: return raw ingredients data
+        return obj.ingredients
+
+    def get_nutrition_info(self, obj):
+        """Handle nutrition_info field safely."""
+        if not obj.nutrition_info:
+            return {}
+        
+        # If it's already a dict, return as is
+        if isinstance(obj.nutrition_info, dict):
+            # Ensure all values are numbers or None
+            safe_nutrition = {}
+            for key, value in obj.nutrition_info.items():
+                if value is not None:
+                    try:
+                        safe_nutrition[key] = float(value)
+                    except (ValueError, TypeError):
+                        safe_nutrition[key] = None
+                else:
+                    safe_nutrition[key] = None
+            return safe_nutrition
+        
+        # Fallback: return empty dict
+        return {}
 
     class Meta:
         model = Recipe
@@ -167,24 +207,20 @@ class RecipeSerializer(serializers.ModelSerializer):
         
         return sanitized_tags
 
-    def validate_ingredients(self, value):
-        """Validate ingredients array."""
-        if not value:
-            raise serializers.ValidationError("At least one ingredient is required")
-        
-        if len(value) > 50:
-            raise serializers.ValidationError("Too many ingredients (max 50)")
-        
-        return value
-
-    def validate_image_url(self, value):
-        """Validate image URL."""
-        if value and not value.strip():
-            return None
-        return value
-
     def validate(self, attrs):
-        """Cross-field validation."""
+        """Cross-field validation including ingredients."""
+        # Validate ingredients from initial_data since we use SerializerMethodField
+        ingredients_data = self.initial_data.get('ingredients', [])
+        if not ingredients_data:
+            raise serializers.ValidationError({
+                'ingredients': 'At least one ingredient is required'
+            })
+        
+        if len(ingredients_data) > 50:
+            raise serializers.ValidationError({
+                'ingredients': 'Too many ingredients (max 50)'
+            })
+        
         # Validate total time consistency if both prep and cook times are provided
         prep_time = attrs.get('prep_time', 0)
         cook_time = attrs.get('cook_time', 0)
@@ -198,20 +234,53 @@ class RecipeSerializer(serializers.ModelSerializer):
         
         return attrs
 
+    def validate_image_url(self, value):
+        """Validate image URL."""
+        if value and not value.strip():
+            return None
+        return value
+
+
+
     def create(self, validated_data):
         """Create a new recipe."""
-        ingredients_data = validated_data.pop('ingredients')
-        nutrition_info_data = validated_data.pop('nutrition_info', {})
+        # Handle ingredients and nutrition_info from initial_data since we use SerializerMethodField
+        ingredients_data = self.initial_data.get('ingredients', [])
+        nutrition_info_data = self.initial_data.get('nutrition_info', {})
         
-        # Convert Decimal values to float for JSON serialization
-        for ingredient in ingredients_data:
-            if 'amount' in ingredient and ingredient['amount'] is not None:
-                ingredient['amount'] = float(ingredient['amount'])
+        # Process ingredients data
+        if ingredients_data:
+            processed_ingredients = []
+            for ingredient in ingredients_data:
+                if isinstance(ingredient, dict):
+                    # Convert Decimal values to float for JSON serialization
+                    if 'amount' in ingredient and ingredient['amount'] is not None:
+                        try:
+                            ingredient['amount'] = float(ingredient['amount'])
+                        except (ValueError, TypeError):
+                            ingredient['amount'] = 1.0
+                    processed_ingredients.append(ingredient)
+                elif isinstance(ingredient, str):
+                    # Convert string to object format
+                    processed_ingredients.append({
+                        'name': ingredient,
+                        'amount': 1.0,
+                        'unit': 'piece',
+                        'notes': ''
+                    })
+            ingredients_data = processed_ingredients
         
-        # Convert nutrition info Decimal values to float
-        for key, value in nutrition_info_data.items():
-            if value is not None and hasattr(value, '__float__'):
-                nutrition_info_data[key] = float(value)
+        # Process nutrition info data safely
+        processed_nutrition = {}
+        if nutrition_info_data and isinstance(nutrition_info_data, dict):
+            for key, value in nutrition_info_data.items():
+                if value is not None:
+                    try:
+                        processed_nutrition[key] = float(value)
+                    except (ValueError, TypeError):
+                        processed_nutrition[key] = None
+                else:
+                    processed_nutrition[key] = None
         
         # Set the created_by_user from the request context
         request = self.context.get('request')
@@ -221,15 +290,16 @@ class RecipeSerializer(serializers.ModelSerializer):
         recipe = Recipe.objects.create(
             **validated_data,
             ingredients=ingredients_data,
-            nutrition_info=nutrition_info_data
+            nutrition_info=processed_nutrition
         )
         
         return recipe
 
     def update(self, instance, validated_data):
         """Update an existing recipe."""
-        ingredients_data = validated_data.pop('ingredients', None)
-        nutrition_info_data = validated_data.pop('nutrition_info', None)
+        # Handle ingredients and nutrition_info from initial_data since we use SerializerMethodField
+        ingredients_data = self.initial_data.get('ingredients')
+        nutrition_info_data = self.initial_data.get('nutrition_info')
         
         # Update basic fields
         for attr, value in validated_data.items():
@@ -237,19 +307,39 @@ class RecipeSerializer(serializers.ModelSerializer):
         
         # Update ingredients if provided
         if ingredients_data is not None:
-            # Convert Decimal values to float for JSON serialization
+            processed_ingredients = []
             for ingredient in ingredients_data:
-                if 'amount' in ingredient and ingredient['amount'] is not None:
-                    ingredient['amount'] = float(ingredient['amount'])
-            instance.ingredients = ingredients_data
+                if isinstance(ingredient, dict):
+                    # Convert Decimal values to float for JSON serialization
+                    if 'amount' in ingredient and ingredient['amount'] is not None:
+                        try:
+                            ingredient['amount'] = float(ingredient['amount'])
+                        except (ValueError, TypeError):
+                            ingredient['amount'] = 1.0
+                    processed_ingredients.append(ingredient)
+                elif isinstance(ingredient, str):
+                    # Convert string to object format
+                    processed_ingredients.append({
+                        'name': ingredient,
+                        'amount': 1.0,
+                        'unit': 'piece',
+                        'notes': ''
+                    })
+            instance.ingredients = processed_ingredients
         
         # Update nutrition info if provided
         if nutrition_info_data is not None:
-            # Convert nutrition info Decimal values to float
-            for key, value in nutrition_info_data.items():
-                if value is not None and hasattr(value, '__float__'):
-                    nutrition_info_data[key] = float(value)
-            instance.nutrition_info = nutrition_info_data
+            processed_nutrition = {}
+            if isinstance(nutrition_info_data, dict):
+                for key, value in nutrition_info_data.items():
+                    if value is not None:
+                        try:
+                            processed_nutrition[key] = float(value)
+                        except (ValueError, TypeError):
+                            processed_nutrition[key] = None
+                    else:
+                        processed_nutrition[key] = None
+            instance.nutrition_info = processed_nutrition
         
         instance.save()
         return instance
@@ -268,10 +358,11 @@ class RecipeSerializer(serializers.ModelSerializer):
 
 
 class RecipeListSerializer(RecipeSerializer):
-    """Simplified serializer for recipe lists (excludes heavy fields)."""
+    """Full serializer for recipe lists (includes all fields including ingredients and instructions)."""
     class Meta(RecipeSerializer.Meta):
         fields = [
-            'id', 'created_by_user_id', 'name', 'description', 'cuisine',
+            'id', 'created_by_user', 'created_by_user_id', 'name', 'description',
+            'ingredients', 'instructions', 'nutrition_info', 'cuisine',
             'prep_time', 'cook_time', 'total_time', 'difficulty', 'avg_rating',
             'rating_count', 'image_url', 'tags', 'created_at', 'updated_at'
         ]

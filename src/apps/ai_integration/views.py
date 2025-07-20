@@ -243,7 +243,7 @@ class CreateRecipeFromAIView(generics.CreateAPIView):
                     'tags': ai_recipe_data['tags']
                 }
                 
-                # Create recipe
+                # Create recipe directly (bypassing serializer validation for ingredients)
                 recipe = Recipe.objects.create(
                     created_by_user=request.user,
                     **recipe_data
@@ -264,13 +264,31 @@ class CreateRecipeFromAIView(generics.CreateAPIView):
                         meal_type=validated_data['meal_plan_type']
                     )
                 
-                # Return the created recipe
-                recipe_serializer = RecipeSerializer(recipe)
+                # Return the created recipe in the expected format
+                recipe_data = {
+                    'id': str(recipe.id),
+                    'created_by_user_id': str(recipe.created_by_user.id) if recipe.created_by_user else None,
+                    'name': recipe.name,
+                    'description': recipe.description,
+                    'ingredients': recipe.ingredients,
+                    'instructions': recipe.instructions,
+                    'nutrition_info': recipe.nutrition_info,
+                    'cuisine': recipe.cuisine,
+                    'prep_time': recipe.prep_time,
+                    'cook_time': recipe.cook_time,
+                    'difficulty': recipe.difficulty,
+                    'avg_rating': float(recipe.avg_rating),
+                    'rating_count': recipe.rating_count,
+                    'image_url': recipe.image_url,
+                    'tags': recipe.tags,
+                    'created_at': recipe.created_at.isoformat(),
+                    'updated_at': recipe.updated_at.isoformat()
+                }
                 
                 logger.info(f"Recipe created from AI data for user {request.user.id}")
                 
                 return Response(
-                    recipe_serializer.data,
+                    recipe_data,
                     status=status.HTTP_201_CREATED
                 )
             else:

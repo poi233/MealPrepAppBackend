@@ -30,14 +30,22 @@ class CustomTokenObtainPairView(TokenObtainPairView):
     def post(self, request, *args, **kwargs):
         """Login user and return tokens with user data."""
         try:
-            username = request.data.get('username')
-            password = request.data.get('password')
+            # Get request data - handle both DRF and raw Django requests
+            if hasattr(request, 'data'):
+                data = request.data
+            else:
+                import json
+                data = json.loads(request.body.decode('utf-8')) if request.body else {}
+            
+            # Support both 'username' and 'email' field names for compatibility
+            username = data.get('username') or data.get('email')
+            password = data.get('password')
             
             if not username or not password:
                 return Response({
                     'error': {
                         'code': 'validation_error',
-                        'message': 'Username and password are required',
+                        'message': 'Username/email and password are required',
                         'details': {
                             'username': ['This field is required.'] if not username else [],
                             'password': ['This field is required.'] if not password else []
