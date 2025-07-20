@@ -9,6 +9,7 @@ django-environ>=0.11.0
 
 # AI Integration
 google-generativeai>=0.3.0
+aiohttp>=3.8.0
 
 # CORS and Security
 django-cors-headers>=4.3.0

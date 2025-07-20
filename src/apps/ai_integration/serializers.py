@@ -179,6 +179,12 @@ class AnalyzeMealPlanSerializer(serializers.Serializer):
     meal_plan_id = serializers.UUIDField(
         help_text="ID of the meal plan to analyze"
     )
+    plan_description = serializers.CharField(
+        max_length=2000,
+        required=False,
+        allow_blank=True,
+        help_text="Original plan description for context"
+    )
     analysis_type = serializers.ChoiceField(
         choices=['nutrition', 'variety', 'balance', 'full'],
         default='full',
@@ -210,10 +216,7 @@ class MealPlanAnalysisSerializer(serializers.Serializer):
     meal_plan_id = serializers.UUIDField()
     analysis_type = serializers.CharField()
     total_recipes = serializers.IntegerField()
-    nutrition_summary = serializers.JSONField()
-    variety_score = serializers.IntegerField()
-    balance_assessment = serializers.JSONField()
-    recommendations = serializers.ListField(child=serializers.CharField())
+    analysis_text = serializers.CharField()
     analysis_date = serializers.DateTimeField()
 
 

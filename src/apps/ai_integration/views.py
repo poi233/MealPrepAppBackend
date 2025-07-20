@@ -59,7 +59,8 @@ class GenerateMealPlanView(generics.CreateAPIView):
             )
             
             # Generate meal plan using AI service
-            result = ai_service.generate_meal_plan(meal_plan_request, request.user)
+            import asyncio
+            result = asyncio.run(ai_service.generate_meal_plan(meal_plan_request, request.user))
             
             if not result['success']:
                 return Response(
@@ -118,7 +119,8 @@ class GenerateRecipeDetailsView(generics.CreateAPIView):
             )
             
             # Generate recipe using AI service
-            result = ai_service.generate_recipe_details(recipe_request, request.user)
+            import asyncio
+            result = asyncio.run(ai_service.generate_recipe_details(recipe_request, request.user))
             
             if not result['success']:
                 return Response(
@@ -175,10 +177,12 @@ class AnalyzeMealPlanView(generics.CreateAPIView):
                 )
             
             # Analyze meal plan using AI service
-            result = ai_service.analyze_meal_plan(
+            import asyncio
+            result = asyncio.run(ai_service.analyze_meal_plan(
                 meal_plan,
+                validated_data.get('plan_description', ''),
                 validated_data.get('analysis_type', 'full')
-            )
+            ))
             
             if not result['success']:
                 return Response(

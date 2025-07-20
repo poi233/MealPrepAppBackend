@@ -10,6 +10,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied, NotFound
+from django.http import Http404
 
 from src.common.pagination import StandardResultsSetPagination
 from src.common.permissions import IsAuthenticatedAndActive
@@ -120,7 +121,7 @@ class MealPlanViewSet(viewsets.ModelViewSet):
             serializer = self.get_serializer(meal_plan)
             return Response(serializer.data)
             
-        except MealPlan.DoesNotExist:
+        except (MealPlan.DoesNotExist, NotFound, Http404):
             return Response(
                 {'error': 'Meal plan not found'},
                 status=status.HTTP_404_NOT_FOUND
