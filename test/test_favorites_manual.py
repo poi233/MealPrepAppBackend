@@ -9,9 +9,9 @@ import django
 from django.conf import settings
 
 # Add src directory to Python path
-src_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src')
-if src_path not in sys.path:
-    sys.path.insert(0, src_path)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC_DIR = os.path.join(BASE_DIR, 'src')
+sys.path.insert(0, SRC_DIR)
 
 # Set up Django
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'mealprep_project.settings.development')
