@@ -194,7 +194,7 @@ class FavoriteViewSet(viewsets.ModelViewSet):
 
 class FavoriteByRecipeView(generics.CreateAPIView, generics.DestroyAPIView):
     """Add/remove recipes from favorites by recipe ID."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedAndActive]
     
     def get_favorite(self, recipe_id):
         """Get favorite by recipe ID and verify ownership."""
@@ -477,7 +477,7 @@ class CollectionViewSet(viewsets.ModelViewSet):
 # Legacy endpoints for backward compatibility
 class FavoriteListView(generics.ListAPIView):
     """List user's favorite recipes."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedAndActive]
     serializer_class = FavoriteListSerializer
     pagination_class = StandardResultsSetPagination
     
@@ -488,7 +488,7 @@ class FavoriteListView(generics.ListAPIView):
 
 class FavoriteDetailView(generics.CreateAPIView, generics.DestroyAPIView):
     """Add/remove recipes from favorites."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticatedAndActive]
     
     def post(self, request, recipe_id):
         """Add recipe to favorites."""

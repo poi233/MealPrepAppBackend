@@ -79,6 +79,10 @@ The API will be available at `http://localhost:8000/`
 - `PUT /api/auth/profile/` - Update user profile
 - `POST /api/auth/change-password/` - Change password
 
+**Note**: All user endpoints return UUID fields as strings. iOS client implements flexible parsing for compatibility.
+
+**iOS Client Resilience**: The iOS client implements resilient parsing patterns that gracefully handle missing or inconsistent fields in API responses, including automatic generation of temporary IDs when backend responses omit required fields. The iOS app also provides custom serialization control for API requests, ensuring consistent data format handling across different backend response variations.
+
 ### Recipes
 - `GET /api/recipes/` - List recipes (with filtering)
 - `POST /api/recipes/` - Create recipe
@@ -94,8 +98,11 @@ The API will be available at `http://localhost:8000/`
 - `DELETE /api/meal-plans/{id}/` - Delete meal plan
 
 ### Favorites
-- `GET /api/favorites/` - List user's favorites
-- `POST /api/favorites/{recipe_id}/` - Add to favorites
+- `GET /api/favorites/favorites/` - List user's favorites (with filtering and pagination)
+- `POST /api/favorites/recipe/{recipe_id}/` - Add recipe to favorites (with rating and notes)
+- `DELETE /api/favorites/recipe/{recipe_id}/` - Remove recipe from favorites
+- `GET /api/favorites/recipe/{recipe_id}/` - Check if recipe is in favorites
+- `PUT /api/favorites/favorites/{favorite_id}/` - Update favorite rating and notes
 - `DELETE /api/favorites/{recipe_id}/` - Remove from favorites
 
 ### AI Integration

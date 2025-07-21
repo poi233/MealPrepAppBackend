@@ -104,8 +104,8 @@ class FavoriteListSerializer(FavoriteSerializer):
 class FavoriteCreateSerializer(serializers.Serializer):
     """Serializer for creating favorites."""
     recipe_id = serializers.UUIDField()
-    personal_rating = serializers.IntegerField(required=False, min_value=1, max_value=5)
-    personal_notes = serializers.CharField(required=False, max_length=1000, allow_blank=True)
+    personal_rating = serializers.IntegerField(required=False, allow_null=True, min_value=1, max_value=5)
+    personal_notes = serializers.CharField(required=False, allow_null=True, max_length=1000, allow_blank=True)
 
     def validate_recipe_id(self, value):
         """Validate that recipe exists."""
