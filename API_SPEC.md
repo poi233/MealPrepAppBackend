@@ -566,6 +566,55 @@ GET /api/recipes/?search=pasta&cuisine=Italian&difficulty=easy&page=1&page_size=
 
 **Success Response (200 OK):** Same format as Create Meal Plan response
 
+### Update Meal Plan
+- **Endpoint:** `PUT /api/meal-plans/{id}/`
+- **Authentication:** Required (only meal plan owner can update)
+- **Description:** Update an existing meal plan with optional complete item replacement
+
+**Request Body:**
+```json
+{
+  "name": "Updated Week Plan",
+  "description": "Updated description",
+  "is_active": true,
+  "items": [
+    {
+      "recipe_id": "recipe-uuid",
+      "day_of_week": 0,
+      "meal_type": "breakfast"
+    },
+    {
+      "recipe_id": "recipe-uuid-2",
+      "day_of_week": 0,
+      "meal_type": "lunch"
+    }
+  ]
+}
+```
+
+**Field Requirements:**
+- `name`: Optional, max 255 characters
+- `description`: Optional, max 1000 characters
+- `is_active`: Optional boolean
+- `plan_description`: Optional, max 2000 characters
+- `analysis_text`: Optional, max 5000 characters
+- `items`: Optional array of meal plan items
+
+**Special Behavior:**
+- If `items` array is provided, all existing meal plan items are deleted and replaced with the new items
+- If `items` is not provided or null, existing items remain unchanged
+- This enables efficient template application and bulk meal plan updates
+- Operation is atomic - all changes are applied together
+
+**Success Response (200 OK):** Same format as Create Meal Plan response
+
+### Delete Meal Plan
+- **Endpoint:** `DELETE /api/meal-plans/{id}/`
+- **Authentication:** Required (only meal plan owner can delete)
+- **Description:** Delete a meal plan and all its items
+
+**Success Response (204 No Content):** Empty response body
+
 ---
 
 ## Favorites Endpoints (`/api/favorites/`)

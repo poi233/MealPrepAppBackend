@@ -20,6 +20,7 @@ from .serializers import (
     MealPlanSerializer,
     MealPlanListSerializer,
     MealPlanCreateSerializer,
+    MealPlanUpdateSerializer,
     MealPlanItemSerializer,
     AddMealPlanItemSerializer,
     MealPlanAnalysisSerializer
@@ -59,6 +60,8 @@ class MealPlanViewSet(viewsets.ModelViewSet):
             return MealPlanListSerializer
         elif self.action == 'create':
             return MealPlanCreateSerializer
+        elif self.action in ['update', 'partial_update']:
+            return MealPlanUpdateSerializer
         return MealPlanSerializer
 
     def list(self, request):

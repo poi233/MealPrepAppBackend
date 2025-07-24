@@ -225,6 +225,40 @@ class MealPlanCreateSerializer(MealPlanSerializer):
         return meal_plan
 
 
+class MealPlanUpdateSerializer(MealPlanSerializer):
+    """Serializer for meal plan updates with items override."""
+    items = MealPlanItemCreateSerializer(many=True, required=False)
+
+    class Meta(MealPlanSerializer.Meta):
+        fields = MealPlanSerializer.Meta.fields
+
+    def update(self, instance, validated_data):
+        """Update meal plan and optionally override items."""
+        items_data = validated_data.pop('items', None)
+        
+        # Update basic meal plan fields
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        
+        # If items are provided, replace all existing items
+        if items_data is not None:
+            # Delete all existing items
+            instance.items.all().delete()
+            
+            # Create new items
+            for item_data in items_data:
+                recipe_id = item_data.pop('recipe_id')
+                recipe = Recipe.objects.get(id=recipe_id)
+                MealPlanItem.objects.create(
+                    meal_plan=instance,
+                    recipe=recipe,
+                    **item_data
+                )
+        
+        return instance
+
+
 class AddMealPlanItemSerializer(serializers.Serializer):
     """Serializer for adding items to a meal plan."""
     recipe_id = serializers.UUIDField()
