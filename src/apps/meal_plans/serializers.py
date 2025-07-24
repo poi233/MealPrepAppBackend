@@ -170,9 +170,39 @@ class MealPlanListSerializer(MealPlanSerializer):
         return obj.items.count()
 
 
+class MealPlanItemCreateSerializer(serializers.ModelSerializer):
+    """Serializer for creating meal plan items during meal plan creation."""
+    recipe_id = serializers.UUIDField()
+
+    class Meta:
+        model = MealPlanItem
+        fields = ['recipe_id', 'day_of_week', 'meal_type']
+
+    def validate_day_of_week(self, value):
+        """Validate day of week."""
+        if value is not None and (value < 0 or value > 6):
+            raise serializers.ValidationError("Day of week must be between 0 (Monday) and 6 (Sunday)")
+        return value
+
+    def validate_meal_type(self, value):
+        """Validate meal type."""
+        valid_meal_types = ['breakfast', 'lunch', 'dinner', 'snack']
+        if value and value not in valid_meal_types:
+            raise serializers.ValidationError(f"Invalid meal type. Must be one of: {', '.join(valid_meal_types)}")
+        return value
+
+    def validate_recipe_id(self, value):
+        """Validate that recipe exists."""
+        try:
+            Recipe.objects.get(id=value)
+        except Recipe.DoesNotExist:
+            raise serializers.ValidationError("Recipe not found")
+        return value
+
+
 class MealPlanCreateSerializer(MealPlanSerializer):
     """Serializer for meal plan creation."""
-    items = MealPlanItemSerializer(many=True, required=False)
+    items = MealPlanItemCreateSerializer(many=True, required=False)
 
     class Meta(MealPlanSerializer.Meta):
         fields = MealPlanSerializer.Meta.fields
