@@ -201,6 +201,9 @@ CORS_ALLOW_CREDENTIALS = True
 GOOGLE_API_KEY = config('GEMINI_API_KEY')
 GENAI_MODEL = 'gemini-2.0-flash-exp'
 
+# Pexels API Settings
+PEXELS_API_KEY = config('PEXELS_API_KEY', default=None)
+
 # Logging
 LOGGING = {
     'version': 1,

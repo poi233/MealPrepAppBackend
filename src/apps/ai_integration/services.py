@@ -4,6 +4,7 @@ AI Integration services for MealPrepAI Django backend.
 import logging
 import json
 import asyncio
+import requests
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime, date
@@ -225,9 +226,12 @@ class AIService:
             # Generate content with retry and parsing validation
             recipe_data = await self._generate_recipe_with_retry(prompt)
             
-            # Create the final recipe structure using AI-generated data
-            generated_image_url = self._generate_recipe_image_url(request.name)
-            final_image_url = recipe_data.get('image_url', generated_image_url)
+            # Fetch image from Pexels API using AI-generated query
+            image_url = self._fetch_pexels_image(
+                recipe_name=request.name,
+                cuisine=recipe_data.get('cuisine'),
+                ai_query=recipe_data.get('pexels_query')
+            )
                         
             recipe = {
                 'name': request.name,
@@ -236,7 +240,7 @@ class AIService:
                 'difficulty': recipe_data.get('difficulty', '中等'),
                 'prep_time': int(recipe_data.get('prep_time', request.prep_time or 15)),
                 'cook_time': int(recipe_data.get('cook_time', request.cook_time or 30)),
-                'image_url': final_image_url,
+                'image_url': image_url,
                 'ingredients': recipe_data.get('ingredients', []),  # List of {name, amount} objects
                 'instructions': recipe_data.get('instructions', []),  # List of strings
                 'nutrition_info': self._generate_mock_nutrition(),  # Keep mock for now
@@ -390,7 +394,7 @@ class AIService:
 - difficulty: 难度等级（"简单"、"中等"、"困难"）
 - prep_time: 准备时间（分钟，整数）
 - cook_time: 烹饪时间（分钟，整数）
-- image_url: 食谱图片URL，使用Unsplash的食物图片，格式为"https://images.unsplash.com/photo-[photo-id]?w=400&h=300&fit=crop"
+- pexels_query: 用于Pexels图片搜索的英文关键词，要简洁且准确描述这道菜的视觉特征（如"chinese braised pork belly"、"italian pasta carbonara"、"japanese sushi rolls"等）
 - ingredients: 配料列表，每个配料包含name和amount字段
 - instructions: 烹饪步骤列表，每个步骤为独立字符串，不需要标出数字顺序但是应符合在数组中的顺序
 - tags: 标签数组，包含相关特征标签
@@ -402,7 +406,7 @@ class AIService:
   "difficulty": "中等",
   "prep_time": 15,
   "cook_time": 20,
-  "image_url": "https://images.unsplash.com/photo-1546833999-b9f581a1996d?w=400&h=300&fit=crop",
+  "pexels_query": "chinese braised chicken rice bowl",
   "ingredients": [
     {{"name": "鸡胸肉", "amount": "150克"}},
     {{"name": "大米", "amount": "80克"}},
@@ -576,9 +580,11 @@ class AIService:
             if 'cook_time' in data and not isinstance(data['cook_time'], (int, float)):
                 raise Exception("Invalid cook_time field - must be a number")
             
-            # Validate image_url field (optional, will use default if missing)
-            if 'image_url' in data and not isinstance(data['image_url'], str):
-                raise Exception("Invalid image_url field - must be a string")
+            # Validate pexels_query field (optional, will use default if missing)
+            if 'pexels_query' in data and not isinstance(data['pexels_query'], str):
+                raise Exception("Invalid pexels_query field - must be a string")
+            
+
             
             # Validate tags field (optional, will use default if missing)
             if 'tags' in data:
@@ -836,32 +842,97 @@ Note: This is a mock recipe. In production, detailed instructions would be gener
         
         return list(set(tags))  # Remove duplicates
     
-    def _generate_recipe_image_url(self, recipe_name: str) -> str:
-        """Generate a recipe image URL using Unsplash."""
-        # Create a hash-based photo ID for consistency
-        import hashlib
-        hash_object = hashlib.md5(recipe_name.encode())
-        hash_hex = hash_object.hexdigest()
-        
-        # Use a selection of food-related Unsplash photo IDs
-        food_photo_ids = [
-            "1546833999-b9f581a1996d",  # General food
-            "1565299624946-b28f40a0ca4b",  # Asian cuisine
-            "1567620905732-2d1ec7ab7445",  # Pasta
-            "1565958011703-00e3a93cebc9",  # Salad
-            "1504674900312-881a367e135f",  # Soup
-            "1565299507177-b0ac66763828",  # Meat dish
-            "1551782400-6ac27de37f69",  # Breakfast
-            "1565299585323-38174c6b8b8b",  # Dessert
-            "1565299624946-b28f40a0ca4b",  # Stir fry
-            "1546833999-b9f581a1996d"   # Default
-        ]
-        
-        # Select photo ID based on hash
-        photo_index = int(hash_hex[:2], 16) % len(food_photo_ids)
-        photo_id = food_photo_ids[photo_index]
-        
-        return f"https://images.unsplash.com/photo-{photo_id}?w=400&h=300&fit=crop"
+    def _fetch_pexels_image(self, recipe_name: str, cuisine: str = None, ai_query: str = None) -> str:
+        """Fetch a relevant food image from Pexels API using AI-generated query."""
+        try:
+            # Check if Pexels API key is configured
+            pexels_api_key = getattr(settings, 'PEXELS_API_KEY', None)
+            if not pexels_api_key:
+                self.logger.warning("PEXELS_API_KEY not configured, using fallback image")
+                return self._get_fallback_image_url()
+            
+            # Check cache first - include ai_query in cache key for better accuracy
+            cache_key = f"pexels_image_{hash(f'{recipe_name}_{ai_query}')}"
+            cached_url = cache.get(cache_key)
+            if cached_url:
+                return cached_url
+            
+            # Prepare search queries with AI-generated query as primary
+            search_queries = []
+            
+            # Primary: Use AI-generated query if available
+            if ai_query and ai_query.strip():
+                search_queries.append(ai_query.strip())
+            
+            # Fallback queries
+            search_queries.extend([
+                f"{recipe_name} food",  # Secondary: specific recipe
+                f"{cuisine} cuisine" if cuisine else "asian food",  # Tertiary: cuisine type
+                "delicious food",  # Quaternary: generic food
+                "healthy meal",  # Final: healthy food
+            ])
+            
+            headers = {
+                'Authorization': pexels_api_key
+            }
+            
+            for query in search_queries:
+                try:
+                    # Make API request to Pexels
+                    response = requests.get(
+                        'https://api.pexels.com/v1/search',
+                        params={
+                            'query': query,
+                            'per_page': 15,
+                            'orientation': 'landscape',
+                            'size': 'medium'
+                        },
+                        headers=headers,
+                        timeout=10
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        photos = data.get('photos', [])
+                        
+                        if photos:
+                            # Get the first suitable image
+                            photo = photos[0]
+                            # Use medium size for better performance
+                            image_url = photo['src']['medium']
+                            
+                            # Cache the result for 24 hours
+                            cache.set(cache_key, image_url, 86400)
+                            
+                            query_type = "AI-generated" if query == ai_query and ai_query else "fallback"
+                            self.logger.info(f"Successfully fetched Pexels image for recipe: {recipe_name} using {query_type} query: '{query}'")
+                            return image_url
+                    
+                    elif response.status_code == 429:
+                        self.logger.warning("Pexels API rate limit exceeded")
+                        break  # Don't try other queries if rate limited
+                    
+                    elif response.status_code == 403:
+                        self.logger.warning("Pexels API access forbidden - check API key")
+                        break
+                    
+                except requests.RequestException as e:
+                    self.logger.warning(f"Request failed for query '{query}': {str(e)}")
+                    continue
+            
+            # If all searches failed, return fallback
+            self.logger.warning(f"Failed to fetch Pexels image for recipe: {recipe_name}")
+            return self._get_fallback_image_url()
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching Pexels image: {str(e)}")
+            return self._get_fallback_image_url()
+    
+    def _get_fallback_image_url(self) -> str:
+        """Get a fallback image URL when Pexels API fails."""
+        # Use a reliable placeholder service or a default food image
+        # This is a high-quality food image from Pexels that doesn't require API access
+        return "https://images.pexels.com/photos/1640777/pexels-photo-1640777.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&fit=crop"
     
     def _generate_recommendations(self, meal_plan, total_recipes: int) -> List[str]:
         """Generate recommendations for meal plan."""
