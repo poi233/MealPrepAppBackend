@@ -55,7 +55,7 @@ class MealPlanItem(models.Model):
         db_table = 'meal_plan_items'
         verbose_name = 'Meal Plan Item'
         verbose_name_plural = 'Meal Plan Items'
-        unique_together = ['meal_plan', 'day_of_week', 'meal_type']
+        unique_together = ['meal_plan', 'day_of_week', 'meal_type', 'recipe']
     
     def __str__(self):
         days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
