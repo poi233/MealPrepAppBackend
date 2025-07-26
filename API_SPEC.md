@@ -815,7 +815,7 @@ GET /api/recipes/?search=pasta&cuisine=Italian&difficulty=easy&page=1&page_size=
 - **Authentication:** Required
 - **Description:** Generate detailed recipe information using AI
 
-**Request Body:**
+**Request Body (Web/Next.js):**
 ```json
 {
   "name": "素食炒面",
@@ -829,15 +829,27 @@ GET /api/recipes/?search=pasta&cuisine=Italian&difficulty=easy&page=1&page_size=
 }
 ```
 
+**Request Body (iOS App - Simplified):**
+```json
+{
+  "name": "素食炒面"
+}
+```
+
 **Request Parameters:**
 - `name`: Required, max 255 characters
-- `cuisine`: Optional string
-- `difficulty`: Optional (easy, medium, hard)
-- `meal_type`: Optional string
-- `prep_time`: Optional integer, 0-1440 minutes
-- `cook_time`: Optional integer, 0-1440 minutes
+- `cuisine`: Optional string (not used by iOS app)
+- `difficulty`: Optional (easy, medium, hard) (not used by iOS app)
+- `meal_type`: Optional string (not used by iOS app)
+- `prep_time`: Optional integer, 0-1440 minutes (not used by iOS app)
+- `cook_time`: Optional integer, 0-1440 minutes (not used by iOS app)
 - `dietary_restrictions`: Optional array
 - `additional_requirements`: Optional string, max 1000 characters
+
+**Platform Notes:**
+- iOS app uses simplified request format with only recipe name
+- Web frontend supports full parameter set for detailed recipe generation
+- Backend accepts both formats since all fields except `name` are optional
 
 **Success Response (201 Created):**
 ```json

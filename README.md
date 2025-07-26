@@ -107,8 +107,14 @@ The API will be available at `http://localhost:8000/`
 
 ### AI Integration
 - `POST /api/ai/generate-meal-plan/` - Generate weekly meal plan
-- `POST /api/ai/generate-recipe-details/` - Generate recipe details
+- `POST /api/ai/generate-recipe-details/` - Generate recipe details (**v2.0.2 - Enhanced**)
 - `POST /api/ai/analyze-meal-plan/` - Analyze meal plan nutrition
+
+**✨ Enhanced Features (v2.0.2):** Recipe generation now includes automatic time estimation, expanded international cuisine classification (Italian, French, Thai, Indian, etc.), smart recipe tagging, and comprehensive descriptions. AI intelligently determines cuisine type and difficulty based on recipe content.
+
+**⚠️ Breaking Change Notice (v2.0):** The recipe generation endpoint returns structured ingredients (`{name, amount}` objects) and instructions as arrays. See `docs/CHANGELOG_AI_INTEGRATION.md` for migration details.
+
+**✅ iOS Compatibility (v2.0.3):** iOS app now fully supports the v2.0 structured ingredient format with automatic parsing and backward compatibility.
 
 ## Development
 

@@ -228,8 +228,15 @@ class CreateRecipeFromAIView(generics.CreateAPIView):
             validated_data = serializer.validated_data
             ai_recipe_data = validated_data['ai_recipe_data']
             
+            # DEBUG: Log AI recipe data to check image_url
+            logger.info(f"[DEBUG] AI recipe data received: {ai_recipe_data}")
+            logger.info(f"[DEBUG] Image URL in AI data: '{ai_recipe_data.get('image_url', 'NOT_FOUND')}'")
+            
             if validated_data.get('save_to_account', True):
                 # Create recipe from AI data
+                image_url_value = ai_recipe_data.get('image_url', '')
+                logger.info(f"[DEBUG] Extracted image_url for recipe_data: '{image_url_value}'")
+                
                 recipe_data = {
                     'name': ai_recipe_data['name'],
                     'description': ai_recipe_data['description'],
@@ -240,14 +247,24 @@ class CreateRecipeFromAIView(generics.CreateAPIView):
                     'ingredients': ai_recipe_data['ingredients'],
                     'instructions': ai_recipe_data['instructions'],
                     'nutrition_info': ai_recipe_data['nutrition_info'],
+                    'image_url': image_url_value,
                     'tags': ai_recipe_data['tags']
                 }
                 
+                logger.info(f"[DEBUG] Final recipe_data before Recipe.objects.create: {recipe_data}")
+                logger.info(f"[DEBUG] recipe_data['image_url']: '{recipe_data['image_url']}'")
+                
                 # Create recipe directly (bypassing serializer validation for ingredients)
+                logger.info(f"[DEBUG] About to call Recipe.objects.create with image_url: '{recipe_data.get('image_url')}'")
+                
                 recipe = Recipe.objects.create(
                     created_by_user=request.user,
                     **recipe_data
                 )
+                
+                logger.info(f"[DEBUG] Recipe created with ID: {recipe.id}")
+                logger.info(f"[DEBUG] Recipe.image_url after creation: '{recipe.image_url}'")
+                logger.info(f"[DEBUG] Recipe object fields: name='{recipe.name}', image_url='{recipe.image_url}'")
                 
                 # Add to meal plan if requested
                 if validated_data.get('add_to_meal_plan'):
@@ -265,7 +282,7 @@ class CreateRecipeFromAIView(generics.CreateAPIView):
                     )
                 
                 # Return the created recipe in the expected format
-                recipe_data = {
+                response_recipe_data = {
                     'id': str(recipe.id),
                     'created_by_user_id': str(recipe.created_by_user.id) if recipe.created_by_user else None,
                     'name': recipe.name,
@@ -285,10 +302,12 @@ class CreateRecipeFromAIView(generics.CreateAPIView):
                     'updated_at': recipe.updated_at.isoformat()
                 }
                 
+                logger.info(f"[DEBUG] Response data image_url: '{response_recipe_data['image_url']}'")
+                
                 logger.info(f"Recipe created from AI data for user {request.user.id}")
                 
                 return Response(
-                    recipe_data,
+                    response_recipe_data,
                     status=status.HTTP_201_CREATED
                 )
             else:

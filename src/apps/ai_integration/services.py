@@ -121,6 +121,39 @@ class AIService:
         
         raise Exception("Failed to generate content after all retries")
     
+    async def _generate_recipe_with_retry(self, prompt: str, max_retries: int = 3) -> Dict[str, Any]:
+        """Generate recipe content with retry logic including JSON parsing validation."""
+        if not self._check_rate_limit():
+            raise Exception("Rate limit exceeded. Please try again later.")
+        
+        for attempt in range(max_retries):
+            try:
+                response = await asyncio.to_thread(
+                    self.model.generate_content,
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.7,
+                        top_p=0.8,
+                        top_k=40,
+                        max_output_tokens=8192,
+                    )
+                )
+                
+                if not response.text:
+                    raise Exception("Empty response from AI model")
+                
+                # Try to parse the response
+                recipe_data = self._parse_recipe_details_response(response.text.strip())
+                return recipe_data
+                    
+            except Exception as e:
+                self.logger.warning(f"Recipe generation attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise Exception(f"Failed to generate valid recipe after {max_retries} attempts: {str(e)}")
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+        
+        raise Exception("Failed to generate valid recipe after all retries")
+    
     async def generate_meal_plan(self, request: MealPlanRequest, user) -> Dict[str, Any]:
         """
         Generate a weekly meal plan using Google Gemini AI.
@@ -189,25 +222,35 @@ class AIService:
             # Build the prompt for recipe generation
             prompt = self._build_recipe_details_prompt(request)
             
-            # Generate content using Gemini
-            response_text = await self._generate_content_with_retry(prompt)
+            # Generate content with retry and parsing validation
+            recipe_data = await self._generate_recipe_with_retry(prompt)
             
-            # Parse the JSON response
-            recipe_data = self._parse_recipe_details_response(response_text)
+            # Create the final recipe structure using AI-generated data
+            generated_image_url = self._generate_recipe_image_url(request.name)
+            final_image_url = recipe_data.get('image_url', generated_image_url)
             
-            # Create the final recipe structure
+            logger.info(f"[DEBUG] AI Service - recipe_data received from AI: {recipe_data}")
+            logger.info(f"[DEBUG] AI Service - Generated image URL: '{generated_image_url}'")
+            logger.info(f"[DEBUG] AI Service - AI provided image_url: '{recipe_data.get('image_url', 'NOT_PROVIDED')}'")
+            logger.info(f"[DEBUG] AI Service - Final image_url used: '{final_image_url}'")
+            
             recipe = {
                 'name': request.name,
-                'description': request.description or f'Delicious {request.name.lower()} recipe',
-                'cuisine': request.cuisine or 'International',
-                'difficulty': request.difficulty,
-                'prep_time': request.prep_time or 15,
-                'cook_time': request.cook_time or 30,
-                'ingredients': recipe_data.get('ingredients', []),
-                'instructions': recipe_data.get('instructions', ''),
+                'description': recipe_data.get('description', f'美味的{request.name}食谱'),
+                'cuisine': recipe_data.get('cuisine', '国际'),
+                'difficulty': recipe_data.get('difficulty', '中等'),
+                'prep_time': int(recipe_data.get('prep_time', request.prep_time or 15)),
+                'cook_time': int(recipe_data.get('cook_time', request.cook_time or 30)),
+                'image_url': final_image_url,
+                'ingredients': recipe_data.get('ingredients', []),  # List of {name, amount} objects
+                'instructions': recipe_data.get('instructions', []),  # List of strings
                 'nutrition_info': self._generate_mock_nutrition(),  # Keep mock for now
-                'tags': self._generate_tags(request)
+                'tags': recipe_data.get('tags', self._generate_tags(request))  # Use AI-generated tags or fallback
             }
+            
+            # DEBUG: Log the final recipe data being returned
+            logger.info(f"[DEBUG] AI Service - Final recipe data: {recipe}")
+            logger.info(f"[DEBUG] AI Service - Recipe image_url: '{recipe.get('image_url', 'NOT_FOUND')}'")
             
             result = {
                 'success': True,
@@ -336,19 +379,58 @@ class AIService:
 
     def _build_recipe_details_prompt(self, request: RecipeGenerationRequest) -> str:
         """Build the prompt for recipe details generation."""
-        return f"""你是一位烹饪助手。根据给定的食谱名称，提供详细的配料清单和全面的烹饪步骤。请用中文回答。
+        return f"""你是一位专业的烹饪助手。根据给定的食谱名称，提供完整的食谱信息。请用中文回答。
+
 食谱名称: {request.name}
 
-关于配料，请提供具体的用量（例如，"面粉1杯"，"2个大鸡蛋，打散"，"鸡胸肉100克，切丁"）。
-关于步骤，请提供清晰、分步的指导，包括适用的烹饪时间和温度。请使用Markdown进行格式化（例如，编号列表、**粗体**强调关键步骤）。
+重要要求：
+1. 所有配料用量必须严格按照**一人份**来计算
+2. 配料名称和用量要分开，用量要精确具体
+3. 烹饪步骤要详细清晰，包含具体的时间和温度
+4. 所有内容必须是中文
+5. 根据食谱名称自动判断菜系风格（如中式、西式、日式、韩式、意式、法式、泰式、印式等）
+6. 根据食谱复杂程度自动判断难度等级（简单、中等、困难）
+7. 估算合理的准备时间和烹饪时间（分钟）
+8. 生成适合的标签（如素食、低脂、高蛋白、快手菜等）
 
-将配料输出为字符串数组，步骤输出为单个字符串。
-确保输出是符合以下模式的有效JSON：
+字段要求：
+- description: 简短的食谱描述（20-30字）
+- cuisine: 菜系风格（如"中式"、"西式"、"日式"等）
+- difficulty: 难度等级（"简单"、"中等"、"困难"）
+- prep_time: 准备时间（分钟，整数）
+- cook_time: 烹饪时间（分钟，整数）
+- image_url: 食谱图片URL，使用Unsplash的食物图片，格式为"https://images.unsplash.com/photo-[photo-id]?w=400&h=300&fit=crop"
+- ingredients: 配料列表，每个配料包含name和amount字段
+- instructions: 烹饪步骤列表，每个步骤为独立字符串，不需要标出数字顺序但是应符合在数组中的顺序
+- tags: 标签数组，包含相关特征标签
+
+请严格按照以下JSON格式输出：
 {{
-  "ingredients": ["详细配料1 (例如, 面粉1杯)", "详细配料2 (例如, 2个大鸡蛋，打散)", ...],
-  "instructions": "1. 第一步详情...\\n2. 第二步详情，包括温度和时间...\\n3. 第三步..."
+  "description": "香嫩可口的家常鸡肉料理，营养丰富",
+  "cuisine": "中式",
+  "difficulty": "中等",
+  "prep_time": 15,
+  "cook_time": 20,
+  "image_url": "https://images.unsplash.com/photo-1546833999-b9f581a1996d?w=400&h=300&fit=crop",
+  "ingredients": [
+    {{"name": "鸡胸肉", "amount": "150克"}},
+    {{"name": "大米", "amount": "80克"}},
+    {{"name": "生抽", "amount": "1汤匙"}},
+    {{"name": "料酒", "amount": "1茶匙"}},
+    {{"name": "盐", "amount": "适量"}},
+    {{"name": "食用油", "amount": "1汤匙"}}
+  ],
+  "instructions": [
+    "将鸡胸肉洗净，切成2厘米见方的小块，用料酒和少许盐腌制10分钟",
+    "大米淘洗干净，放入电饭煲中，加入适量清水，按下煮饭键",
+    "热锅下油，油温6成热时下入鸡肉块，大火炒制3-4分钟至表面微黄",
+    "加入生抽调色调味，继续炒制2分钟至鸡肉完全熟透",
+    "盛起装盘，搭配米饭一起享用"
+  ],
+  "tags": ["家常菜", "高蛋白", "下饭菜", "营养丰富"]
 }}
-为给定的名称提供一个典型、常见且详细的食谱。"""
+
+请为"{request.name}"提供一个营养均衡的、一人份的完整食谱信息。确保所有字段都包含在JSON中，并且格式正确。"""
 
     def _build_meal_plan_analysis_prompt(self, plan_description: str, meal_plan_data: str) -> str:
         """Build the prompt for meal plan analysis."""
@@ -479,15 +561,63 @@ class AIService:
             # Parse JSON
             data = json.loads(json_content)
             
-            # Validate the data
+            # Validate the data structure
             if not isinstance(data, dict):
                 raise Exception("Response is not a JSON object")
             
+            # Validate description field (optional, will use default if missing)
+            if 'description' in data and not isinstance(data['description'], str):
+                raise Exception("Invalid description field - must be a string")
+            
+            # Validate cuisine field (optional, will use default if missing)
+            if 'cuisine' in data and not isinstance(data['cuisine'], str):
+                raise Exception("Invalid cuisine field - must be a string")
+            
+            # Validate difficulty field (optional, will use default if missing)
+            if 'difficulty' in data and not isinstance(data['difficulty'], str):
+                raise Exception("Invalid difficulty field - must be a string")
+            
+            # Validate prep_time field (optional, will use default if missing)
+            if 'prep_time' in data and not isinstance(data['prep_time'], (int, float)):
+                raise Exception("Invalid prep_time field - must be a number")
+            
+            # Validate cook_time field (optional, will use default if missing)
+            if 'cook_time' in data and not isinstance(data['cook_time'], (int, float)):
+                raise Exception("Invalid cook_time field - must be a number")
+            
+            # Validate image_url field (optional, will use default if missing)
+            if 'image_url' in data and not isinstance(data['image_url'], str):
+                raise Exception("Invalid image_url field - must be a string")
+            
+            # Validate tags field (optional, will use default if missing)
+            if 'tags' in data:
+                if not isinstance(data['tags'], list):
+                    raise Exception("Invalid tags field - must be a list")
+                for i, tag in enumerate(data['tags']):
+                    if not isinstance(tag, str):
+                        raise Exception(f"Tag {i} is not a string")
+            
+            # Validate ingredients field
             if 'ingredients' not in data or not isinstance(data['ingredients'], list):
                 raise Exception("Missing or invalid ingredients field")
             
-            if 'instructions' not in data or not isinstance(data['instructions'], str):
+            # Validate each ingredient object
+            for i, ingredient in enumerate(data['ingredients']):
+                if not isinstance(ingredient, dict):
+                    raise Exception(f"Ingredient {i} is not an object")
+                if 'name' not in ingredient or not isinstance(ingredient['name'], str):
+                    raise Exception(f"Ingredient {i} missing or invalid 'name' field")
+                if 'amount' not in ingredient or not isinstance(ingredient['amount'], str):
+                    raise Exception(f"Ingredient {i} missing or invalid 'amount' field")
+            
+            # Validate instructions field
+            if 'instructions' not in data or not isinstance(data['instructions'], list):
                 raise Exception("Missing or invalid instructions field")
+            
+            # Validate each instruction
+            for i, instruction in enumerate(data['instructions']):
+                if not isinstance(instruction, str):
+                    raise Exception(f"Instruction {i} is not a string")
             
             return data
             
@@ -714,6 +844,33 @@ Note: This is a mock recipe. In production, detailed instructions would be gener
             tags.append('easy')
         
         return list(set(tags))  # Remove duplicates
+    
+    def _generate_recipe_image_url(self, recipe_name: str) -> str:
+        """Generate a recipe image URL using Unsplash."""
+        # Create a hash-based photo ID for consistency
+        import hashlib
+        hash_object = hashlib.md5(recipe_name.encode())
+        hash_hex = hash_object.hexdigest()
+        
+        # Use a selection of food-related Unsplash photo IDs
+        food_photo_ids = [
+            "1546833999-b9f581a1996d",  # General food
+            "1565299624946-b28f40a0ca4b",  # Asian cuisine
+            "1567620905732-2d1ec7ab7445",  # Pasta
+            "1565958011703-00e3a93cebc9",  # Salad
+            "1504674900312-881a367e135f",  # Soup
+            "1565299507177-b0ac66763828",  # Meat dish
+            "1551782400-6ac27de37f69",  # Breakfast
+            "1565299585323-38174c6b8b8b",  # Dessert
+            "1565299624946-b28f40a0ca4b",  # Stir fry
+            "1546833999-b9f581a1996d"   # Default
+        ]
+        
+        # Select photo ID based on hash
+        photo_index = int(hash_hex[:2], 16) % len(food_photo_ids)
+        photo_id = food_photo_ids[photo_index]
+        
+        return f"https://images.unsplash.com/photo-{photo_id}?w=400&h=300&fit=crop"
     
     def _generate_recommendations(self, meal_plan, total_recipes: int) -> List[str]:
         """Generate recommendations for meal plan."""

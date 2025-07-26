@@ -160,6 +160,12 @@ class GenerateRecipeSerializer(serializers.Serializer):
         return value
 
 
+class IngredientSerializer(serializers.Serializer):
+    """Serializer for individual ingredient with name and amount."""
+    name = serializers.CharField(help_text="Ingredient name (e.g., '鸡胸肉')")
+    amount = serializers.CharField(help_text="Ingredient amount for one serving (e.g., '150克')")
+
+
 class GeneratedRecipeSerializer(serializers.Serializer):
     """Serializer for generated recipe response."""
     name = serializers.CharField()
@@ -168,8 +174,15 @@ class GeneratedRecipeSerializer(serializers.Serializer):
     difficulty = serializers.CharField()
     prep_time = serializers.IntegerField()
     cook_time = serializers.IntegerField()
-    ingredients = serializers.ListField(child=serializers.CharField())
-    instructions = serializers.CharField()
+    image_url = serializers.CharField()
+    ingredients = serializers.ListField(
+        child=IngredientSerializer(),
+        help_text="List of ingredients with name and amount for one serving"
+    )
+    instructions = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="List of cooking steps as separate strings"
+    )
     nutrition_info = serializers.JSONField()
     tags = serializers.ListField(child=serializers.CharField())
 
