@@ -228,12 +228,7 @@ class AIService:
             # Create the final recipe structure using AI-generated data
             generated_image_url = self._generate_recipe_image_url(request.name)
             final_image_url = recipe_data.get('image_url', generated_image_url)
-            
-            logger.info(f"[DEBUG] AI Service - recipe_data received from AI: {recipe_data}")
-            logger.info(f"[DEBUG] AI Service - Generated image URL: '{generated_image_url}'")
-            logger.info(f"[DEBUG] AI Service - AI provided image_url: '{recipe_data.get('image_url', 'NOT_PROVIDED')}'")
-            logger.info(f"[DEBUG] AI Service - Final image_url used: '{final_image_url}'")
-            
+                        
             recipe = {
                 'name': request.name,
                 'description': recipe_data.get('description', f'美味的{request.name}食谱'),
@@ -247,11 +242,7 @@ class AIService:
                 'nutrition_info': self._generate_mock_nutrition(),  # Keep mock for now
                 'tags': recipe_data.get('tags', self._generate_tags(request))  # Use AI-generated tags or fallback
             }
-            
-            # DEBUG: Log the final recipe data being returned
-            logger.info(f"[DEBUG] AI Service - Final recipe data: {recipe}")
-            logger.info(f"[DEBUG] AI Service - Recipe image_url: '{recipe.get('image_url', 'NOT_FOUND')}'")
-            
+                        
             result = {
                 'success': True,
                 'recipe': recipe
