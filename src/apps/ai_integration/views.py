@@ -2,18 +2,22 @@
 AI Integration views for MealPrepAI Django backend.
 """
 import logging
+import uuid
 from datetime import date, timedelta
 from django.db import transaction
+from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from drf_yasg.utils import swagger_auto_schema
+from drf_yasg import openapi
 
 from src.common.permissions import IsAuthenticatedAndActive
 from apps.recipes.models import Recipe
 from apps.recipes.serializers import RecipeSerializer
 from apps.meal_plans.models import MealPlan, MealPlanItem
-from .services import ai_service, MealPlanRequest, RecipeGenerationRequest
+from .services import ai_service, MealPlanRequest, RecipeGenerationRequest, generate_deterministic_recipe_uuid
 from .serializers import (
     GenerateMealPlanSerializer,
     GeneratedMealPlanSerializer,
@@ -23,7 +27,10 @@ from .serializers import (
     MealPlanAnalysisSerializer,
     CreateRecipeFromAISerializer,
     SuggestRecipeModificationsSerializer,
-    RecipeModificationSuggestionsSerializer
+    RecipeModificationSuggestionsSerializer,
+    RecipeCreationResponseSerializer,
+    BatchCreateRecipesResponseSerializer,
+    StandardAPIResponseSerializer
 )
 
 logger = logging.getLogger(__name__)
@@ -71,7 +78,9 @@ class GenerateMealPlanView(generics.CreateAPIView):
             # Serialize the generated meal plan
             meal_plan_serializer = GeneratedMealPlanSerializer(result['meal_plan'])
             
+            # DEBUG: Log the serialized response
             logger.info(f"AI meal plan generated for user {request.user.id}")
+            logger.info(f"[DEBUG] Serialized meal plan response: {meal_plan_serializer.data}")
             
             return Response(
                 meal_plan_serializer.data,
@@ -209,118 +218,714 @@ class AnalyzeMealPlanView(generics.CreateAPIView):
 
 
 class CreateRecipeFromAIView(generics.CreateAPIView):
-    """Create a recipe from AI-generated data."""
+    """
+    Create a recipe from AI-generated data with enhanced duplicate checking and batch support.
+    
+    This endpoint supports Scene A: "Save to Template" functionality where users can save
+    individual AI-generated recipes to their account with comprehensive duplicate detection.
+    
+    Key Features:
+    - Deterministic UUID generation based on recipe content
+    - Advanced duplicate detection using content similarity
+    - Comprehensive data validation and sanitization
+    - Optional meal plan integration
+    - Performance monitoring and logging
+    
+    Response Format:
+    - success: Boolean indicating operation success
+    - recipe: Full recipe data if successful
+    - status: 'created', 'already_exists', 'updated', or 'failed'
+    - message: User-friendly status description
+    - recipe_id: UUID of the created/existing recipe
+    - timestamp: ISO timestamp of the operation
+    """
     permission_classes = [IsAuthenticatedAndActive]
     serializer_class = CreateRecipeFromAISerializer
     
+    def _validate_nutrition_info(self, nutrition_info):
+        """Validate nutrition info structure and content with enhanced security."""
+        from apps.recipes.serializers import NutritionInfoSerializer
+        
+        if not nutrition_info:
+            return True, "No nutrition info provided"
+        
+        if not isinstance(nutrition_info, dict):
+            return False, "Nutrition info must be a dictionary"
+        
+        # Use the enhanced NutritionInfoSerializer for validation
+        nutrition_serializer = NutritionInfoSerializer(data=nutrition_info)
+        if not nutrition_serializer.is_valid():
+            errors = []
+            for field, field_errors in nutrition_serializer.errors.items():
+                errors.append(f"{field}: {', '.join(field_errors)}")
+            return False, f"Nutrition info validation failed: {'; '.join(errors)}"
+        
+        return True, "Nutrition info validation passed"
+    
+    def _validate_ingredients_structure(self, ingredients_data):
+        """Validate ingredients structure with enhanced security checks."""
+        if not ingredients_data:
+            return False, "At least one ingredient is required"
+        
+        if not isinstance(ingredients_data, list):
+            return False, "Ingredients must be a list"
+        
+        if len(ingredients_data) > 50:
+            return False, "Too many ingredients (max 50)"
+        
+        for i, ingredient in enumerate(ingredients_data):
+            if isinstance(ingredient, str):
+                # String ingredients are acceptable
+                if len(ingredient.strip()) == 0:
+                    return False, f"Ingredient {i} cannot be empty"
+            elif isinstance(ingredient, dict):
+                # Structured ingredient validation
+                if 'name' not in ingredient:
+                    return False, f"Ingredient {i}: 'name' field is required"
+                
+                if not isinstance(ingredient['name'], str) or not ingredient['name'].strip():
+                    return False, f"Ingredient {i}: name must be a non-empty string"
+                
+                # Validate amount if present
+                if 'amount' in ingredient:
+                    amount = ingredient['amount']
+                    if not isinstance(amount, (str, int, float)):
+                        return False, f"Ingredient {i}: amount must be a string or number"
+                    
+                    if isinstance(amount, str) and not amount.strip():
+                        return False, f"Ingredient {i}: amount cannot be empty"
+                
+                # Validate other optional fields
+                optional_fields = ['unit', 'notes']
+                for field in optional_fields:
+                    if field in ingredient and ingredient[field] is not None:
+                        if not isinstance(ingredient[field], str):
+                            return False, f"Ingredient {i}: {field} must be a string"
+                        
+                        # Check for excessively long strings
+                        max_lengths = {'unit': 50, 'notes': 500}
+                        if field in max_lengths and len(ingredient[field]) > max_lengths[field]:
+                            return False, f"Ingredient {i}: {field} is too long (max {max_lengths[field]} characters)"
+            else:
+                return False, f"Ingredient {i}: must be a string or dictionary"
+        
+        return True, "Ingredients validation passed"
+    
+    def _validate_recipe_data(self, recipe_data: dict) -> tuple[bool, str]:
+        """Enhanced validation for recipe data completeness and integrity.
+        
+        Args:
+            recipe_data: Dictionary containing recipe data
+            
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        try:
+            # Required fields validation
+            required_fields = ['name', 'ingredients', 'instructions']
+            for field in required_fields:
+                if field not in recipe_data or not recipe_data[field]:
+                    return False, f"Missing required field: {field}"
+            
+            # Name validation
+            if not isinstance(recipe_data['name'], str) or len(recipe_data['name'].strip()) < 2:
+                return False, "Recipe name must be a non-empty string with at least 2 characters"
+            
+            # Validate name length and content
+            name = recipe_data['name'].strip()
+            if len(name) > 255:
+                return False, "Recipe name is too long (max 255 characters)"
+            
+            # Check for potentially malicious content in name
+            if any(char in name for char in ['<', '>', '{', '}', '"', "'", ';']):
+                return False, "Recipe name contains invalid characters"
+            
+            # Enhanced ingredients validation
+            is_valid, error_msg = self._validate_ingredients_structure(recipe_data['ingredients'])
+            if not is_valid:
+                return False, error_msg
+            
+            # Instructions validation (can be list or string)
+            instructions = recipe_data['instructions']
+            if isinstance(instructions, list):
+                if len(instructions) == 0:
+                    return False, "Instructions list cannot be empty"
+                for i, instruction in enumerate(instructions):
+                    if not isinstance(instruction, str) or not instruction.strip():
+                        return False, f"Instruction {i} must be a non-empty string"
+                    if len(instruction) > 1000:
+                        return False, f"Instruction {i} is too long (max 1000 characters)"
+            elif isinstance(instructions, str):
+                if not instructions.strip():
+                    return False, "Instructions string cannot be empty"
+                if len(instructions) > 10000:
+                    return False, "Instructions are too long (max 10,000 characters)"
+            else:
+                return False, "Instructions must be a list of strings or a single string"
+            
+            # Enhanced nutrition info validation
+            if 'nutrition_info' in recipe_data and recipe_data['nutrition_info']:
+                is_valid, error_msg = self._validate_nutrition_info(recipe_data['nutrition_info'])
+                if not is_valid:
+                    return False, error_msg
+            
+            # Numeric fields validation with reasonable ranges
+            numeric_fields = ['prep_time', 'cook_time']
+            for field in numeric_fields:
+                if field in recipe_data and recipe_data[field] is not None:
+                    value = recipe_data[field]
+                    if not isinstance(value, (int, float)):
+                        return False, f"{field} must be a number"
+                    if value < 0:
+                        return False, f"{field} cannot be negative"
+                    if value > 1440:  # Max 24 hours in minutes
+                        return False, f"{field} cannot exceed 1440 minutes (24 hours)"
+            
+            # String fields validation with length limits
+            string_field_limits = {
+                'description': 2000,
+                'cuisine': 100,
+                'difficulty': 20,
+                'image_url': 500
+            }
+            
+            for field, max_length in string_field_limits.items():
+                if field in recipe_data and recipe_data[field] is not None:
+                    value = recipe_data[field]
+                    if not isinstance(value, str):
+                        return False, f"{field} must be a string"
+                    if len(value) > max_length:
+                        return False, f"{field} is too long (max {max_length} characters)"
+            
+            # Validate difficulty enum
+            if 'difficulty' in recipe_data and recipe_data['difficulty'] is not None:
+                valid_difficulties = ['easy', 'medium', 'hard', '简单', '中等', '困难', 'Easy', 'Medium', 'Hard']
+                if recipe_data['difficulty'] not in valid_difficulties:
+                    return False, f"Invalid difficulty level. Must be one of: {', '.join(valid_difficulties[:3])}"
+            
+            # Validate tags if present
+            if 'tags' in recipe_data and recipe_data['tags'] is not None:
+                tags = recipe_data['tags']
+                if not isinstance(tags, list):
+                    return False, "Tags must be a list"
+                if len(tags) > 20:
+                    return False, "Too many tags (max 20)"
+                for i, tag in enumerate(tags):
+                    if not isinstance(tag, str):
+                        return False, f"Tag {i} must be a string"
+                    if len(tag.strip()) == 0:
+                        return False, f"Tag {i} cannot be empty"
+                    if len(tag) > 50:
+                        return False, f"Tag {i} is too long (max 50 characters)"
+            
+            return True, "Enhanced validation passed"
+            
+        except Exception as e:
+            logger.error(f"Error validating recipe data: {str(e)}", exc_info=True)
+            return False, f"Validation error: {str(e)}"
+    
+    def _sanitize_recipe_data(self, recipe_data: dict) -> dict:
+        """Sanitize and normalize recipe data.
+        
+        Args:
+            recipe_data: Raw recipe data dictionary
+            
+        Returns:
+            Sanitized recipe data dictionary
+        """
+        try:
+            sanitized = recipe_data.copy()
+            
+            # Sanitize string fields
+            string_fields = ['name', 'description', 'cuisine', 'difficulty', 'image_url']
+            for field in string_fields:
+                if field in sanitized and sanitized[field] is not None:
+                    if isinstance(sanitized[field], str):
+                        sanitized[field] = sanitized[field].strip()
+                    else:
+                        sanitized[field] = str(sanitized[field]).strip()
+            
+            # Ensure numeric fields are integers
+            numeric_fields = ['prep_time', 'cook_time']
+            for field in numeric_fields:
+                if field in sanitized and sanitized[field] is not None:
+                    try:
+                        sanitized[field] = int(float(sanitized[field]))
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid {field} value: {sanitized[field]}, setting to default")
+                        sanitized[field] = 30 if field == 'cook_time' else 15
+            
+            # Sanitize ingredients
+            if 'ingredients' in sanitized and isinstance(sanitized['ingredients'], list):
+                sanitized_ingredients = []
+                for ingredient in sanitized['ingredients']:
+                    if isinstance(ingredient, dict) and 'name' in ingredient and 'amount' in ingredient:
+                        sanitized_ingredients.append({
+                            'name': str(ingredient['name']).strip(),
+                            'amount': str(ingredient['amount']).strip()
+                        })
+                sanitized['ingredients'] = sanitized_ingredients
+            
+            # Sanitize and normalize instructions (handle list to TextField conversion)
+            if 'instructions' in sanitized:
+                instructions_data = sanitized['instructions']
+                if isinstance(instructions_data, list):
+                    # Convert list to numbered text format for TextField storage
+                    steps = [str(step).strip() for step in instructions_data if step]
+                    if steps:
+                        numbered_steps = [f"{i+1}. {step}" for i, step in enumerate(steps)]
+                        sanitized['instructions'] = '\n'.join(numbered_steps)
+                    else:
+                        sanitized['instructions'] = ''
+                elif isinstance(instructions_data, str):
+                    sanitized['instructions'] = instructions_data.strip()
+                else:
+                    sanitized['instructions'] = ''
+            
+            # Ensure tags is a list
+            if 'tags' not in sanitized or not isinstance(sanitized['tags'], list):
+                sanitized['tags'] = []
+            else:
+                sanitized['tags'] = [str(tag).strip() for tag in sanitized['tags'] if str(tag).strip()]
+            
+            # Set default values for missing optional fields
+            defaults = {
+                'description': f"美味的{sanitized.get('name', '食谱')}",
+                'cuisine': '国际',
+                'difficulty': '中等',
+                'prep_time': 15,
+                'cook_time': 30,
+                'image_url': '',
+                'nutrition_info': {},
+                'tags': []
+            }
+            
+            for field, default_value in defaults.items():
+                if field not in sanitized or sanitized[field] is None or sanitized[field] == '':
+                    sanitized[field] = default_value
+            
+            return sanitized
+            
+        except Exception as e:
+            logger.error(f"Error sanitizing recipe data: {str(e)}", exc_info=True)
+            return recipe_data  # Return original data if sanitization fails
+    
+    def _check_content_similarity(self, new_recipe_data: dict, user) -> tuple[bool, Recipe or None]:
+        """Check for content similarity with existing recipes.
+        
+        Args:
+            new_recipe_data: New recipe data to check
+            user: User creating the recipe
+            
+        Returns:
+            Tuple of (is_duplicate, existing_recipe_or_none)
+        """
+        try:
+            # Generate content-based UUID for the new recipe
+            content_uuid = generate_deterministic_recipe_uuid(new_recipe_data)
+            
+            # Check if a recipe with this content-based UUID already exists
+            try:
+                existing_recipe = Recipe.objects.get(id=content_uuid)
+                logger.info(f"Found existing recipe with content-based ID {content_uuid}: {existing_recipe.name}")
+                return True, existing_recipe
+            except Recipe.DoesNotExist:
+                pass
+            
+            # Additional similarity check for user-specific recipes
+            # Check recipes created by the same user with similar names
+            similar_name_recipes = Recipe.objects.filter(
+                created_by_user=user,
+                name__icontains=new_recipe_data['name'][:20]  # First 20 chars of name
+            ).exclude(id=content_uuid)  # Exclude the content-based UUID we just checked
+            
+            for recipe in similar_name_recipes:
+                # Simple similarity check based on ingredient count and name similarity
+                if (abs(len(recipe.ingredients) - len(new_recipe_data['ingredients'])) <= 2 and
+                    self._calculate_name_similarity(recipe.name, new_recipe_data['name']) > 0.8):
+                    logger.info(f"Found similar recipe by name/ingredients: {recipe.name} (ID: {recipe.id})")
+                    return True, recipe
+            
+            return False, None
+            
+        except Exception as e:
+            logger.error(f"Error checking content similarity: {str(e)}", exc_info=True)
+            return False, None
+    
+    def _calculate_name_similarity(self, name1: str, name2: str) -> float:
+        """Calculate simple name similarity score.
+        
+        Args:
+            name1: First name to compare
+            name2: Second name to compare
+            
+        Returns:
+            Similarity score between 0 and 1
+        """
+        try:
+            # Simple Jaccard similarity based on character sets
+            set1 = set(name1.lower().replace(' ', ''))
+            set2 = set(name2.lower().replace(' ', ''))
+            
+            if not set1 and not set2:
+                return 1.0
+            if not set1 or not set2:
+                return 0.0
+            
+            intersection = len(set1.intersection(set2))
+            union = len(set1.union(set2))
+            
+            return intersection / union if union > 0 else 0.0
+            
+        except Exception:
+            return 0.0
+    
+    def _create_recipe_with_predefined_id(self, recipe_data: dict, recipe_id: str, user) -> tuple[Recipe, bool]:
+        """Create a recipe with a predefined ID, implementing comprehensive duplicate checking.
+        
+        Args:
+            recipe_data: Dictionary containing recipe data (must be sanitized)
+            recipe_id: The predefined UUID string to use as the recipe ID
+            user: The user creating the recipe
+            
+        Returns:
+            Tuple of (Recipe instance, was_created)
+            
+        Raises:
+            ValueError: If recipe_id is not a valid UUID format or data is invalid
+        """
+        try:
+            # Validate UUID format
+            try:
+                uuid_obj = uuid.UUID(recipe_id)
+            except ValueError:
+                raise ValueError(f"Invalid UUID format: {recipe_id}")
+            
+            # Check if recipe with this exact ID already exists (direct lookup)
+            try:
+                existing_recipe = Recipe.objects.get(id=recipe_id)
+                logger.info(f"Recipe with ID {recipe_id} already exists: {existing_recipe.name}")
+                return existing_recipe, False
+            except Recipe.DoesNotExist:
+                pass
+            
+            # Generate deterministic UUID based on content for consistency check
+            content_based_uuid = generate_deterministic_recipe_uuid(recipe_data)
+            
+            # Check if the provided ID matches the content-based ID
+            if content_based_uuid != recipe_id:
+                logger.warning(
+                    f"Provided ID {recipe_id} doesn't match content-based ID {content_based_uuid}. "
+                    f"Recipe: {recipe_data.get('name', 'Unknown')}"
+                )
+                
+                # Check if a recipe with the content-based UUID already exists
+                try:
+                    existing_recipe = Recipe.objects.get(id=content_based_uuid)
+                    logger.info(
+                        f"Found existing recipe with content-based ID {content_based_uuid}: {existing_recipe.name}"
+                    )
+                    return existing_recipe, False
+                except Recipe.DoesNotExist:
+                    pass
+            
+            # For deterministic behavior, always use the content-based UUID
+            final_recipe_id = content_based_uuid
+            final_uuid_obj = uuid.UUID(final_recipe_id)
+            
+            # Final check: if recipe with content-based ID exists, return it
+            try:
+                existing_recipe = Recipe.objects.get(id=final_recipe_id)
+                logger.info(
+                    f"Recipe with content-based ID {final_recipe_id} already exists: {existing_recipe.name}"
+                )
+                return existing_recipe, False
+            except Recipe.DoesNotExist:
+                pass
+            
+            # Perform additional similarity check
+            is_duplicate, similar_recipe = self._check_content_similarity(recipe_data, user)
+            if is_duplicate and similar_recipe:
+                logger.info(
+                    f"Found similar recipe during similarity check: {similar_recipe.name} (ID: {similar_recipe.id})"
+                )
+                return similar_recipe, False
+            
+            # Create new recipe with content-based deterministic ID
+            # Remove 'id' from recipe_data to avoid conflict with constructor parameter
+            recipe_data_clean = {k: v for k, v in recipe_data.items() if k != 'id'}
+            recipe = Recipe(
+                id=final_uuid_obj,
+                created_by_user=user,
+                **recipe_data_clean
+            )
+            recipe.save()
+            
+            logger.info(
+                f"Created new recipe with deterministic content-based ID: {final_recipe_id}, "
+                f"Name: {recipe.name}, User: {user.id}"
+            )
+            return recipe, True
+            
+        except Exception as e:
+            logger.error(f"Error creating recipe with predefined ID: {str(e)}", exc_info=True)
+            raise
+    
+    @swagger_auto_schema(
+        operation_description="Create a single recipe from AI-generated data (Scene A: Save to Template)",
+        operation_summary="Save AI Recipe to Template",
+        request_body=CreateRecipeFromAISerializer,
+        responses={
+            201: openapi.Response('Recipe created successfully', RecipeCreationResponseSerializer),
+            200: openapi.Response('Recipe already exists', RecipeCreationResponseSerializer),
+            400: openapi.Response('Validation failed'),
+            500: openapi.Response('Server error')
+        },
+        tags=['AI Integration - Recipe Creation']
+    )
     @transaction.atomic
     def post(self, request):
-        """Create a recipe from AI-generated data and optionally add to meal plan."""
+        """Create a recipe from AI-generated data with enhanced validation and duplicate checking."""
         try:
+            # Start timing for performance monitoring
+            start_time = timezone.now()
+            
+            # Validate request data
             serializer = self.get_serializer(data=request.data, context={'request': request})
             
             if not serializer.is_valid():
+                logger.warning(
+                    f"Recipe creation validation failed for user {request.user.id}: {serializer.errors}"
+                )
                 return Response(
-                    {'error': 'Validation failed', 'details': serializer.errors},
+                    {
+                        'success': False,
+                        'message': '输入数据验证失败',
+                        'errors': serializer.errors,
+                        'timestamp': timezone.now().isoformat()
+                    },
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
             validated_data = serializer.validated_data
             ai_recipe_data = validated_data['ai_recipe_data']
+            save_to_account = validated_data.get('save_to_account', True)
             
-            # DEBUG: Log AI recipe data to check image_url
-            logger.info(f"[DEBUG] AI recipe data received: {ai_recipe_data}")
-            logger.info(f"[DEBUG] Image URL in AI data: '{ai_recipe_data.get('image_url', 'NOT_FOUND')}'")
+            logger.info(
+                f"Processing recipe creation request for user {request.user.id}: "
+                f"Recipe='{ai_recipe_data.get('name', 'Unknown')}', Save={save_to_account}"
+            )
             
-            if validated_data.get('save_to_account', True):
-                # Create recipe from AI data
-                image_url_value = ai_recipe_data.get('image_url', '')
-                logger.info(f"[DEBUG] Extracted image_url for recipe_data: '{image_url_value}'")
-                
-                recipe_data = {
-                    'name': ai_recipe_data['name'],
-                    'description': ai_recipe_data['description'],
-                    'cuisine': ai_recipe_data['cuisine'],
-                    'difficulty': ai_recipe_data['difficulty'],
-                    'prep_time': ai_recipe_data['prep_time'],
-                    'cook_time': ai_recipe_data['cook_time'],
-                    'ingredients': ai_recipe_data['ingredients'],
-                    'instructions': ai_recipe_data['instructions'],
-                    'nutrition_info': ai_recipe_data['nutrition_info'],
-                    'image_url': image_url_value,
-                    'tags': ai_recipe_data['tags']
-                }
-                
-                logger.info(f"[DEBUG] Final recipe_data before Recipe.objects.create: {recipe_data}")
-                logger.info(f"[DEBUG] recipe_data['image_url']: '{recipe_data['image_url']}'")
-                
-                # Create recipe directly (bypassing serializer validation for ingredients)
-                logger.info(f"[DEBUG] About to call Recipe.objects.create with image_url: '{recipe_data.get('image_url')}'")
-                
-                recipe = Recipe.objects.create(
-                    created_by_user=request.user,
-                    **recipe_data
-                )
-                
-                logger.info(f"[DEBUG] Recipe created with ID: {recipe.id}")
-                logger.info(f"[DEBUG] Recipe.image_url after creation: '{recipe.image_url}'")
-                logger.info(f"[DEBUG] Recipe object fields: name='{recipe.name}', image_url='{recipe.image_url}'")
-                
-                # Add to meal plan if requested
-                if validated_data.get('add_to_meal_plan'):
-                    meal_plan = MealPlan.objects.get(
-                        id=validated_data['add_to_meal_plan'],
-                        user=request.user
-                    )
-                    
-                    # Add to meal plan
-                    MealPlanItem.objects.create(
-                        meal_plan=meal_plan,
-                        recipe=recipe,
-                        day_of_week=validated_data['meal_plan_day'],
-                        meal_type=validated_data['meal_plan_type']
-                    )
-                
-                # Return the created recipe in the expected format
-                response_recipe_data = {
-                    'id': str(recipe.id),
-                    'created_by_user_id': str(recipe.created_by_user.id) if recipe.created_by_user else None,
-                    'name': recipe.name,
-                    'description': recipe.description,
-                    'ingredients': recipe.ingredients,
-                    'instructions': recipe.instructions,
-                    'nutrition_info': recipe.nutrition_info,
-                    'cuisine': recipe.cuisine,
-                    'prep_time': recipe.prep_time,
-                    'cook_time': recipe.cook_time,
-                    'difficulty': recipe.difficulty,
-                    'avg_rating': float(recipe.avg_rating),
-                    'rating_count': recipe.rating_count,
-                    'image_url': recipe.image_url,
-                    'tags': recipe.tags,
-                    'created_at': recipe.created_at.isoformat(),
-                    'updated_at': recipe.updated_at.isoformat()
-                }
-                
-                logger.info(f"[DEBUG] Response data image_url: '{response_recipe_data['image_url']}'")
-                
-                logger.info(f"Recipe created from AI data for user {request.user.id}")
-                
-                return Response(
-                    response_recipe_data,
-                    status=status.HTTP_201_CREATED
-                )
-            else:
+            if not save_to_account:
                 # Just return the AI-generated data without saving
+                logger.info(f"Returning AI data without saving for user {request.user.id}")
                 return Response(
                     ai_recipe_data,
                     status=status.HTTP_200_OK
                 )
             
-        except Exception as e:
-            logger.error(f"Error creating recipe from AI data: {str(e)}", exc_info=True)
+            # Extract and validate recipe data
+            recipe_data = {
+                'name': ai_recipe_data.get('name'),
+                'description': ai_recipe_data.get('description'),
+                'cuisine': ai_recipe_data.get('cuisine'),
+                'difficulty': ai_recipe_data.get('difficulty'),
+                'prep_time': ai_recipe_data.get('prep_time'),
+                'cook_time': ai_recipe_data.get('cook_time'),
+                'ingredients': ai_recipe_data.get('ingredients'),
+                'instructions': ai_recipe_data.get('instructions'),
+                'nutrition_info': ai_recipe_data.get('nutrition_info', {}),
+                'image_url': ai_recipe_data.get('image_url', ''),
+                'tags': ai_recipe_data.get('tags', [])
+            }
+            
+            # Validate recipe data completeness
+            is_valid, validation_error = self._validate_recipe_data(recipe_data)
+            if not is_valid:
+                logger.error(f"Recipe data validation failed for user {request.user.id}: {validation_error}")
+                return Response(
+                    {
+                        'success': False,
+                        'message': '食谱数据无效',
+                        'errors': {'recipe_data': validation_error},
+                        'timestamp': timezone.now().isoformat()
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Sanitize recipe data
+            recipe_data = self._sanitize_recipe_data(recipe_data)
+            
+            # Extract recipe ID from AI data if available
+            ai_recipe_id = ai_recipe_data.get('id')
+            recipe = None
+            was_created = False
+            
+            try:
+                if ai_recipe_id:
+                    # Use predefined ID method with enhanced duplicate checking
+                    recipe, was_created = self._create_recipe_with_predefined_id(
+                        recipe_data, ai_recipe_id, request.user
+                    )
+                    action_type = "created" if was_created else "found_existing"
+                    logger.info(
+                        f"Recipe {action_type} with predefined ID {ai_recipe_id} for user {request.user.id}: "
+                        f"{recipe.name} (Final ID: {recipe.id})"
+                    )
+                else:
+                    # Check for duplicates before creating
+                    is_duplicate, existing_recipe = self._check_content_similarity(recipe_data, request.user)
+                    if is_duplicate and existing_recipe:
+                        recipe = existing_recipe
+                        was_created = False
+                        logger.info(
+                            f"Found existing similar recipe for user {request.user.id}: "
+                            f"{recipe.name} (ID: {recipe.id})"
+                        )
+                    else:
+                        # Create new recipe with content-based deterministic ID
+                        content_uuid = generate_deterministic_recipe_uuid(recipe_data)
+                        # Remove 'id' from recipe_data to avoid conflict with constructor parameter
+                        recipe_data_clean = {k: v for k, v in recipe_data.items() if k != 'id'}
+                        recipe = Recipe(
+                            id=uuid.UUID(content_uuid),
+                            created_by_user=request.user,
+                            **recipe_data_clean
+                        )
+                        recipe.save()
+                        was_created = True
+                        logger.info(
+                            f"Created new recipe with content-based ID {content_uuid} for user {request.user.id}: "
+                            f"{recipe.name}"
+                        )
+                
+            except ValueError as e:
+                logger.error(f"Recipe creation failed with ValueError for user {request.user.id}: {str(e)}")
+                return Response(
+                    {
+                        'success': False,
+                        'message': '食谱创建失败',
+                        'errors': {'creation_error': str(e)},
+                        'timestamp': timezone.now().isoformat()
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Add to meal plan if requested
+            meal_plan_added = False
+            if validated_data.get('add_to_meal_plan'):
+                try:
+                    meal_plan = MealPlan.objects.get(
+                        id=validated_data['add_to_meal_plan'],
+                        user=request.user
+                    )
+                    
+                    # Check if the recipe is already in the meal plan for this day/meal
+                    existing_item = MealPlanItem.objects.filter(
+                        meal_plan=meal_plan,
+                        recipe=recipe,
+                        day_of_week=validated_data['meal_plan_day'],
+                        meal_type=validated_data['meal_plan_type']
+                    ).first()
+                    
+                    if not existing_item:
+                        MealPlanItem.objects.create(
+                            meal_plan=meal_plan,
+                            recipe=recipe,
+                            day_of_week=validated_data['meal_plan_day'],
+                            meal_type=validated_data['meal_plan_type']
+                        )
+                        meal_plan_added = True
+                        logger.info(
+                            f"Added recipe {recipe.id} to meal plan {meal_plan.id} for user {request.user.id}"
+                        )
+                    else:
+                        logger.info(
+                            f"Recipe {recipe.id} already exists in meal plan {meal_plan.id} for the specified day/meal"
+                        )
+                        
+                except MealPlan.DoesNotExist:
+                    logger.error(f"Meal plan {validated_data['add_to_meal_plan']} not found for user {request.user.id}")
+                    return Response(
+                        {
+                            'success': False,
+                            'message': '膳食计划未找到',
+                            'errors': {'meal_plan_id': 'Meal plan not found or not accessible'},
+                            'timestamp': timezone.now().isoformat()
+                        },
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+                except Exception as e:
+                    logger.error(f"Error adding recipe to meal plan: {str(e)}", exc_info=True)
+                    # Don't fail the entire request if meal plan addition fails
+                    meal_plan_added = False
+            
+            # Prepare standardized response data for Scene A: Save to Template
+            recipe_data_for_response = {
+                'id': str(recipe.id),
+                'created_by_user_id': str(recipe.created_by_user.id) if recipe.created_by_user else None,
+                'name': recipe.name,
+                'description': recipe.description,
+                'ingredients': recipe.ingredients,
+                'instructions': recipe.instructions,
+                'nutrition_info': recipe.nutrition_info,
+                'cuisine': recipe.cuisine,
+                'prep_time': recipe.prep_time,
+                'cook_time': recipe.cook_time,
+                'difficulty': recipe.difficulty,
+                'avg_rating': float(recipe.avg_rating),
+                'rating_count': recipe.rating_count,
+                'image_url': recipe.image_url,
+                'tags': recipe.tags,
+                'created_at': recipe.created_at.isoformat(),
+                'updated_at': recipe.updated_at.isoformat()
+            }
+            
+            # Determine status message
+            if was_created:
+                status_msg = "created"
+                user_message = f"成功创建新食谱: {recipe.name}"
+            else:
+                status_msg = "already_exists"
+                user_message = f"食谱已存在: {recipe.name}"
+            
+            if meal_plan_added:
+                user_message += " 并已添加到膳食计划"
+            
+            # Create standardized response using new serializer format
+            response_data = {
+                'success': True,
+                'recipe': recipe_data_for_response,
+                'status': status_msg,
+                'message': user_message,
+                'recipe_id': str(recipe.id),
+                'timestamp': timezone.now().isoformat()
+            }
+            
+            # Log success metrics
+            end_time = timezone.now()
+            processing_time = (end_time - start_time).total_seconds() * 1000
+            logger.info(
+                f"Recipe creation completed for user {request.user.id}: "
+                f"Recipe={recipe.name} (ID: {recipe.id}), "
+                f"Created={was_created}, MealPlanAdded={meal_plan_added}, "
+                f"ProcessingTime={processing_time:.2f}ms"
+            )
+            
             return Response(
-                {'error': 'Failed to create recipe from AI data'},
+                response_data,
+                status=status.HTTP_201_CREATED if was_created else status.HTTP_200_OK
+            )
+            
+        except Exception as e:
+            logger.error(f"Unexpected error in recipe creation for user {getattr(request, 'user', {}).get('id', 'unknown')}: {str(e)}", exc_info=True)
+            return Response(
+                {
+                    'success': False,
+                    'message': '服务器内部错误',
+                    'errors': {'server_error': 'Internal server error during recipe creation'},
+                    'timestamp': timezone.now().isoformat()
+                },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
@@ -397,6 +1002,388 @@ class SuggestRecipeModificationsView(generics.CreateAPIView):
                 {'error': 'Failed to suggest recipe modifications'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+@swagger_auto_schema(
+    method='post',
+    operation_description="""
+    Create multiple recipes from AI-generated data in batch (Scene B: Apply Meal Plan).
+    
+    This endpoint supports efficient batch processing of up to 20 recipes at once,
+    with individual transaction control and detailed status reporting.
+    
+    Key Features:
+    - Batch processing with individual transaction rollback capability
+    - Comprehensive duplicate detection across the batch
+    - Optional meal plan integration for all recipes
+    - Detailed per-recipe status reporting
+    - Performance optimization for large batches
+    - Partial success handling (some recipes can fail without affecting others)
+    
+    Performance Targets:
+    - Processing time: < 2 seconds for typical batches
+    - Memory efficient processing with individual transactions
+    - Graceful degradation under high load
+    
+    Response Format:
+    - success: Boolean indicating overall batch success
+    - total_processed: Total number of recipes in the batch
+    - successful: Number of successfully processed recipes
+    - failed: Number of failed recipe creations
+    - already_exists: Number of recipes that already existed
+    - summary: Detailed processing statistics and metadata
+    - results: Array of per-recipe processing results
+    - timestamp: ISO timestamp of batch completion
+    - processing_time: Actual processing time in seconds
+    """,
+    operation_summary="Batch Create AI Recipes (Apply Meal Plan)",
+    request_body=openapi.Schema(
+        type=openapi.TYPE_OBJECT,
+        properties={
+            'recipes': openapi.Schema(
+                type=openapi.TYPE_ARRAY,
+                items=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'ai_recipe_data': openapi.Schema(
+                            type=openapi.TYPE_OBJECT,
+                            description='AI-generated recipe data'
+                        ),
+                        'meal_plan_day': openapi.Schema(
+                            type=openapi.TYPE_INTEGER,
+                            minimum=0,
+                            maximum=6,
+                            description='Day of week (0=Monday, 6=Sunday)'
+                        ),
+                        'meal_plan_type': openapi.Schema(
+                            type=openapi.TYPE_STRING,
+                            enum=['breakfast', 'lunch', 'dinner', 'snack']
+                        )
+                    }
+                ),
+                min_items=1,
+                max_items=20
+            ),
+            'meal_plan_id': openapi.Schema(
+                type=openapi.TYPE_STRING,
+                format=openapi.FORMAT_UUID,
+                description='Optional meal plan ID to add all recipes to'
+            ),
+            'save_to_account': openapi.Schema(
+                type=openapi.TYPE_BOOLEAN,
+                default=True,
+                description='Whether to save all recipes to user account'
+            ),
+            'skip_duplicates': openapi.Schema(
+                type=openapi.TYPE_BOOLEAN,
+                default=True,
+                description='Whether to skip recipes that already exist'
+            )
+        },
+        required=['recipes']
+    ),
+    responses={
+        200: openapi.Response('Batch processing completed', BatchCreateRecipesResponseSerializer),
+        400: openapi.Response('Validation failed or invalid request format'),
+        404: openapi.Response('Meal plan not found'),
+        500: openapi.Response('Server error during batch processing')
+    },
+    tags=['AI Integration - Batch Operations']
+)
+@api_view(['POST'])
+@permission_classes([IsAuthenticatedAndActive])
+def batch_create_recipes_from_ai(request):
+    """
+    Create multiple recipes from AI-generated data in batch for optimal performance.
+    
+    Scene B: "Apply Meal Plan" - Efficiently processes entire meal plans with
+    up to 20 recipes while maintaining data integrity and providing detailed feedback.
+    """
+    try:
+        start_time = timezone.now()
+        
+        # Validate request data structure
+        if not isinstance(request.data, dict) or 'recipes' not in request.data:
+            return Response(
+                {
+                    'success': False,
+                    'total_processed': 0,
+                    'successful': 0,
+                    'failed': 0,
+                    'already_exists': 0,
+                    'summary': {'error': 'Invalid request format'},
+                    'results': [],
+                    'timestamp': timezone.now().isoformat(),
+                    'processing_time': 0.0
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        recipes_data = request.data['recipes']
+        if not isinstance(recipes_data, list) or len(recipes_data) == 0:
+            return Response(
+                {
+                    'success': False,
+                    'total_processed': 0,
+                    'successful': 0,
+                    'failed': 0,
+                    'already_exists': 0,
+                    'summary': {'error': 'Recipes must be a non-empty array'},
+                    'results': [],
+                    'timestamp': timezone.now().isoformat(),
+                    'processing_time': 0.0
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Performance optimization: Limit batch size and add processing hints
+        max_batch_size = 20
+        if len(recipes_data) > max_batch_size:
+            return Response(
+                {
+                    'success': False,
+                    'total_processed': 0,
+                    'successful': 0,
+                    'failed': 0,
+                    'already_exists': 0,
+                    'summary': {
+                        'error': f'Maximum {max_batch_size} recipes per batch for optimal performance',
+                        'recommendation': 'Split large batches into smaller chunks for better reliability'
+                    },
+                    'results': [],
+                    'timestamp': timezone.now().isoformat(),
+                    'processing_time': 0.0
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        logger.info(f"Starting batch recipe creation for user {request.user.id}: {len(recipes_data)} recipes")
+        
+        # Get optional meal plan info for bulk assignment
+        meal_plan_id = request.data.get('meal_plan_id')
+        meal_plan = None
+        if meal_plan_id:
+            try:
+                meal_plan = MealPlan.objects.get(id=meal_plan_id, user=request.user)
+            except MealPlan.DoesNotExist:
+                return Response(
+                    {
+                        'success': False,
+                        'total_processed': 0,
+                        'successful': 0,
+                        'failed': 0,
+                        'already_exists': 0,
+                        'summary': {'error': 'Meal plan not found'},
+                        'results': [],
+                        'timestamp': timezone.now().isoformat(),
+                        'processing_time': 0.0
+                    },
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        
+        # Process each recipe
+        results = []
+        created_count = 0
+        existing_count = 0
+        error_count = 0
+        
+        # Performance optimization: Pre-initialize recipe view and prepare bulk operations
+        recipe_view = CreateRecipeFromAIView()
+        
+        # Performance monitoring: Track processing speed
+        recipes_per_second_target = 10  # Target processing speed
+        estimated_time = len(recipes_data) / recipes_per_second_target
+        logger.info(f"Starting batch processing: {len(recipes_data)} recipes, estimated time: {estimated_time:.1f}s")
+        
+        # Process recipes with granular transaction control to avoid long locks
+        # Each recipe gets its own transaction for individual rollback capability
+        for i, recipe_item in enumerate(recipes_data):
+            try:
+                # Validate recipe item structure first
+                if not isinstance(recipe_item, dict) or 'ai_recipe_data' not in recipe_item:
+                    results.append({
+                        'index': i,
+                        'success': False,
+                        'error': 'Invalid recipe format - missing ai_recipe_data',
+                        'recipe_name': recipe_item.get('name', f'Recipe {i}')
+                    })
+                    error_count += 1
+                    continue
+                
+                # Process within individual transaction
+                with transaction.atomic():
+                    
+                    ai_recipe_data = recipe_item['ai_recipe_data']
+                    recipe_name = ai_recipe_data.get('name', f'Recipe {i}')
+                    
+                    # Extract recipe data and validate
+                    recipe_data = {
+                        'name': ai_recipe_data.get('name'),
+                        'description': ai_recipe_data.get('description'),
+                        'cuisine': ai_recipe_data.get('cuisine'),
+                        'difficulty': ai_recipe_data.get('difficulty'),
+                        'prep_time': ai_recipe_data.get('prep_time'),
+                        'cook_time': ai_recipe_data.get('cook_time'),
+                        'ingredients': ai_recipe_data.get('ingredients'),
+                        'instructions': ai_recipe_data.get('instructions'),
+                        'nutrition_info': ai_recipe_data.get('nutrition_info', {}),
+                        'image_url': ai_recipe_data.get('image_url', ''),
+                        'tags': ai_recipe_data.get('tags', [])
+                    }
+                    
+                    # Validate recipe data
+                    is_valid, validation_error = recipe_view._validate_recipe_data(recipe_data)
+                    if not is_valid:
+                        # Don't need transaction rollback as we'll exit the transaction context
+                        raise ValueError(f'Validation failed: {validation_error}')
+                    
+                    # Sanitize recipe data
+                    recipe_data = recipe_view._sanitize_recipe_data(recipe_data)
+                    
+                    # Create or find recipe
+                    ai_recipe_id = ai_recipe_data.get('id')
+                    recipe = None
+                    was_created = False
+                    
+                    if ai_recipe_id:
+                        recipe, was_created = recipe_view._create_recipe_with_predefined_id(
+                            recipe_data, ai_recipe_id, request.user
+                        )
+                    else:
+                        # Check for duplicates
+                        is_duplicate, existing_recipe = recipe_view._check_content_similarity(recipe_data, request.user)
+                        if is_duplicate and existing_recipe:
+                            recipe = existing_recipe
+                            was_created = False
+                        else:
+                            # Create new recipe
+                            content_uuid = generate_deterministic_recipe_uuid(recipe_data)
+                            # Remove 'id' from recipe_data to avoid conflict with constructor parameter
+                            recipe_data_clean = {k: v for k, v in recipe_data.items() if k != 'id'}
+                            recipe = Recipe(
+                                id=uuid.UUID(content_uuid),
+                                created_by_user=request.user,
+                                **recipe_data_clean
+                            )
+                            recipe.save()
+                            was_created = True
+                    
+                    # Add to meal plan if specified
+                    meal_plan_added = False
+                    if meal_plan and 'meal_plan_day' in recipe_item and 'meal_plan_type' in recipe_item:
+                        try:
+                            existing_item = MealPlanItem.objects.filter(
+                                meal_plan=meal_plan,
+                                recipe=recipe,
+                                day_of_week=recipe_item['meal_plan_day'],
+                                meal_type=recipe_item['meal_plan_type']
+                            ).first()
+                            
+                            if not existing_item:
+                                MealPlanItem.objects.create(
+                                    meal_plan=meal_plan,
+                                    recipe=recipe,
+                                    day_of_week=recipe_item['meal_plan_day'],
+                                    meal_type=recipe_item['meal_plan_type']
+                                )
+                                meal_plan_added = True
+                        except Exception as e:
+                            logger.warning(f"Failed to add recipe {recipe.id} to meal plan: {str(e)}")
+                    
+                    # Record success
+                    results.append({
+                        'index': i,
+                        'success': True,
+                        'recipe_id': str(recipe.id),
+                        'recipe_name': recipe.name,
+                        'was_created': was_created,
+                        'meal_plan_added': meal_plan_added
+                    })
+                    
+                    if was_created:
+                        created_count += 1
+                    else:
+                        existing_count += 1
+                        
+            except Exception as e:
+                logger.error(f"Error processing recipe {i} in batch: {str(e)}", exc_info=True)
+                results.append({
+                    'index': i,
+                    'success': False,
+                    'error': str(e),
+                    'recipe_name': recipe_item.get('ai_recipe_data', {}).get('name', f'Recipe {i}')
+                })
+                error_count += 1
+        
+        # Prepare enhanced summary response for Scene B: Apply Meal Plan
+        end_time = timezone.now()
+        processing_time = (end_time - start_time).total_seconds()
+        
+        # Convert results to new standardized format
+        formatted_results = []
+        for result in results:
+            if result['success']:
+                formatted_results.append({
+                    'recipe_id': result['recipe_id'],
+                    'name': result['recipe_name'],
+                    'status': 'created' if result['was_created'] else 'already_exists',
+                    'error': None,
+                    'meal_plan_added': result.get('meal_plan_added', False)
+                })
+            else:
+                formatted_results.append({
+                    'recipe_id': None,
+                    'name': result['recipe_name'],
+                    'status': 'failed',
+                    'error': result['error'],
+                    'meal_plan_added': False
+                })
+        
+        # Create standardized response using BatchCreateRecipesResponseSerializer format
+        response_data = {
+            'success': True,
+            'total_processed': len(recipes_data),
+            'successful': created_count + existing_count,
+            'failed': error_count,
+            'already_exists': existing_count,
+            'summary': {
+                'total_recipes': len(recipes_data),
+                'new_recipes_created': created_count,
+                'existing_recipes_found': existing_count,
+                'failed_recipes': error_count,
+                'meal_plan_id': str(meal_plan.id) if meal_plan else None,
+                'meal_plan_name': meal_plan.name if meal_plan else None,
+                'processing_time_seconds': round(processing_time, 2)
+            },
+            'results': formatted_results,
+            'timestamp': timezone.now().isoformat(),
+            'processing_time': processing_time
+        }
+        
+        logger.info(
+            f"Batch recipe creation completed for user {request.user.id}: "
+            f"Total={len(recipes_data)}, Created={created_count}, Existing={existing_count}, "
+            f"Errors={error_count}, Time={processing_time:.2f}ms"
+        )
+        
+        return Response(response_data, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        logger.error(f"Unexpected error in batch recipe creation: {str(e)}", exc_info=True)
+        return Response(
+            {
+                'success': False,
+                'total_processed': 0,
+                'successful': 0,
+                'failed': 0,
+                'already_exists': 0,
+                'summary': {'error': 'Internal server error during batch processing'},
+                'results': [],
+                'timestamp': timezone.now().isoformat(),
+                'processing_time': 0.0
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 
 @api_view(['POST'])

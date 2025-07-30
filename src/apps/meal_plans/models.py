@@ -49,6 +49,13 @@ class MealPlanItem(models.Model):
         help_text="0=Monday, 1=Tuesday, ..., 6=Sunday"
     )
     meal_type = models.CharField(max_length=20, choices=MEAL_TYPE_CHOICES)
+    serving_size = models.DecimalField(
+        max_digits=5, 
+        decimal_places=2, 
+        default=1.0,
+        validators=[MinValueValidator(0.1)],
+        help_text="Number of servings (e.g., 1.0, 1.5, 2.0)"
+    )
     added_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

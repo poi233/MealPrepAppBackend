@@ -48,35 +48,93 @@ class IngredientSerializer(serializers.Serializer):
 
 
 class NutritionInfoSerializer(serializers.Serializer):
-    """Serializer for nutrition information."""
+    """Serializer for nutrition information with enhanced validation."""
     calories = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0
+        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=5000
     )
     protein = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0
+        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=500
     )
     carbs = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0
+        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=1000
+    )
+    carbohydrates = serializers.DecimalField(
+        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=1000
     )
     fat = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0
+        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=300
     )
     fiber = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0
+        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=100
     )
     sugar = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0
+        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=200
     )
     sodium = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0
+        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=10000
+    )
+    servings = serializers.IntegerField(
+        required=False, allow_null=True, min_value=1, max_value=50
     )
 
     def validate(self, attrs):
-        """Validate nutrition info values."""
-        # Round all values to 2 decimal places
+        """Enhanced validation for nutrition info values."""
+        # Allowed nutrition fields
+        allowed_fields = {
+            'calories', 'protein', 'carbs', 'carbohydrates', 'fat', 
+            'fiber', 'sugar', 'sodium', 'servings'
+        }
+        
+        # Check for unknown fields
+        unknown_fields = set(attrs.keys()) - allowed_fields
+        if unknown_fields:
+            raise serializers.ValidationError(
+                f"Unknown nutrition fields: {', '.join(unknown_fields)}"
+            )
+        
+        # Round all numeric values to 2 decimal places and validate ranges
         for field, value in attrs.items():
             if value is not None:
-                attrs[field] = round(float(value), 2)
+                if field == 'servings':
+                    # Servings should be an integer
+                    attrs[field] = int(value)
+                else:
+                    # Other fields are decimals
+                    rounded_value = round(float(value), 2)
+                    
+                    # Additional range validation
+                    if rounded_value < 0:
+                        raise serializers.ValidationError(
+                            f"{field} cannot be negative"
+                        )
+                    
+                    # Reasonable upper bounds for nutrition values
+                    max_values = {
+                        'calories': 5000,
+                        'protein': 500,
+                        'carbs': 1000,
+                        'carbohydrates': 1000,
+                        'fat': 300,
+                        'fiber': 100,
+                        'sugar': 200,
+                        'sodium': 10000
+                    }
+                    
+                    if field in max_values and rounded_value > max_values[field]:
+                        raise serializers.ValidationError(
+                            f"{field} value {rounded_value} seems unreasonably high (max: {max_values[field]})"
+                        )
+                    
+                    attrs[field] = rounded_value
+        
+        # Cross-field validation
+        if 'carbs' in attrs and 'carbohydrates' in attrs:
+            if attrs['carbs'] is not None and attrs['carbohydrates'] is not None:
+                if abs(attrs['carbs'] - attrs['carbohydrates']) > 0.1:
+                    raise serializers.ValidationError(
+                        "carbs and carbohydrates fields should have the same value"
+                    )
+        
         return attrs
 
 
@@ -154,11 +212,41 @@ class RecipeSerializer(serializers.ModelSerializer):
             return self._sanitize_text(value.strip(), 1000)
         return value
 
+    def _normalize_instructions_field(self, instructions_data):
+        """Normalize instructions field to match database TextField.
+        
+        Args:
+            instructions_data: Can be list of strings or a single string
+            
+        Returns:
+            String formatted for TextField storage
+        """
+        if isinstance(instructions_data, list):
+            # Convert list to text, with numbered steps
+            steps = [str(step).strip() for step in instructions_data if step]
+            if not steps:
+                return ''
+            # Create numbered instructions
+            numbered_steps = [f"{i+1}. {step}" for i, step in enumerate(steps)]
+            return '\n'.join(numbered_steps)
+        elif isinstance(instructions_data, str):
+            return instructions_data.strip()
+        else:
+            return ''
+    
     def validate_instructions(self, value):
         """Validate recipe instructions."""
-        if not value or not value.strip():
+        # First normalize the instructions format
+        normalized_value = self._normalize_instructions_field(value)
+        
+        if not normalized_value or not normalized_value.strip():
             raise serializers.ValidationError("Recipe instructions are required")
-        return self._sanitize_text(value.strip(), 5000)
+        
+        # Validate length
+        if len(normalized_value) > 10000:  # Increased limit for detailed instructions
+            raise serializers.ValidationError("Instructions are too long (max 10,000 characters)")
+        
+        return self._sanitize_text(normalized_value.strip(), 10000)
 
     def validate_cuisine(self, value):
         """Validate cuisine."""
@@ -207,19 +295,93 @@ class RecipeSerializer(serializers.ModelSerializer):
         
         return sanitized_tags
 
-    def validate(self, attrs):
-        """Cross-field validation including ingredients."""
-        # Validate ingredients from initial_data since we use SerializerMethodField
-        ingredients_data = self.initial_data.get('ingredients', [])
-        if not ingredients_data:
+    def _validate_nutrition_info(self, nutrition_info):
+        """Validate nutrition info structure and content with enhanced security."""
+        if not nutrition_info:
+            return {}
+        
+        if not isinstance(nutrition_info, dict):
+            raise serializers.ValidationError("Nutrition info must be a dictionary")
+        
+        # Use the NutritionInfoSerializer for validation
+        nutrition_serializer = NutritionInfoSerializer(data=nutrition_info)
+        if not nutrition_serializer.is_valid():
             raise serializers.ValidationError({
-                'ingredients': 'At least one ingredient is required'
+                'nutrition_info': nutrition_serializer.errors
             })
         
+        return nutrition_serializer.validated_data
+    
+    def _validate_ingredients_structure(self, ingredients_data):
+        """Validate ingredients structure with enhanced security checks."""
+        if not ingredients_data:
+            raise serializers.ValidationError("At least one ingredient is required")
+        
+        if not isinstance(ingredients_data, list):
+            raise serializers.ValidationError("Ingredients must be a list")
+        
         if len(ingredients_data) > 50:
-            raise serializers.ValidationError({
-                'ingredients': 'Too many ingredients (max 50)'
-            })
+            raise serializers.ValidationError("Too many ingredients (max 50)")
+        
+        validated_ingredients = []
+        
+        for i, ingredient in enumerate(ingredients_data):
+            if isinstance(ingredient, str):
+                # Convert string ingredient to structured format
+                if len(ingredient.strip()) == 0:
+                    continue  # Skip empty strings
+                
+                validated_ingredients.append({
+                    'name': self._sanitize_text(ingredient.strip(), 100),
+                    'amount': '1',
+                    'unit': 'piece',
+                    'notes': ''
+                })
+            elif isinstance(ingredient, dict):
+                # Validate structured ingredient
+                if 'name' not in ingredient:
+                    raise serializers.ValidationError(
+                        f"Ingredient {i}: 'name' field is required"
+                    )
+                
+                if not isinstance(ingredient['name'], str) or not ingredient['name'].strip():
+                    raise serializers.ValidationError(
+                        f"Ingredient {i}: name must be a non-empty string"
+                    )
+                
+                # Validate and sanitize ingredient fields
+                validated_ingredient = {
+                    'name': self._sanitize_text(str(ingredient['name']).strip(), 100),
+                    'amount': self._sanitize_text(str(ingredient.get('amount', '1')).strip(), 20),
+                    'unit': self._sanitize_text(str(ingredient.get('unit', 'piece')).strip(), 20),
+                    'notes': self._sanitize_text(str(ingredient.get('notes', '')).strip(), 200)
+                }
+                
+                # Additional validation for amount field
+                amount_str = validated_ingredient['amount']
+                if not amount_str or amount_str.isspace():
+                    validated_ingredient['amount'] = '1'
+                
+                validated_ingredients.append(validated_ingredient)
+            else:
+                raise serializers.ValidationError(
+                    f"Ingredient {i}: must be a string or dictionary"
+                )
+        
+        if not validated_ingredients:
+            raise serializers.ValidationError("At least one valid ingredient is required")
+        
+        return validated_ingredients
+
+    def validate(self, attrs):
+        """Enhanced cross-field validation including ingredients and nutrition info."""
+        # Validate ingredients from initial_data since we use SerializerMethodField
+        ingredients_data = self.initial_data.get('ingredients', [])
+        validated_ingredients = self._validate_ingredients_structure(ingredients_data)
+        
+        # Validate nutrition_info from initial_data  
+        nutrition_info_data = self.initial_data.get('nutrition_info', {})
+        validated_nutrition = self._validate_nutrition_info(nutrition_info_data)
         
         # Validate total time consistency if both prep and cook times are provided
         prep_time = attrs.get('prep_time', 0)
@@ -244,9 +406,14 @@ class RecipeSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         """Create a new recipe."""
-        # Handle ingredients and nutrition_info from initial_data since we use SerializerMethodField
+        # Handle ingredients, nutrition_info, and instructions from initial_data since we use SerializerMethodField
         ingredients_data = self.initial_data.get('ingredients', [])
         nutrition_info_data = self.initial_data.get('nutrition_info', {})
+        instructions_data = self.initial_data.get('instructions')
+        
+        # Normalize instructions if provided in initial_data
+        if instructions_data is not None:
+            validated_data['instructions'] = self._normalize_instructions_field(instructions_data)
         
         # Process ingredients data
         if ingredients_data:
@@ -297,9 +464,14 @@ class RecipeSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         """Update an existing recipe."""
-        # Handle ingredients and nutrition_info from initial_data since we use SerializerMethodField
+        # Handle ingredients, nutrition_info, and instructions from initial_data since we use SerializerMethodField
         ingredients_data = self.initial_data.get('ingredients')
         nutrition_info_data = self.initial_data.get('nutrition_info')
+        instructions_data = self.initial_data.get('instructions')
+        
+        # Normalize instructions if provided in initial_data
+        if instructions_data is not None:
+            validated_data['instructions'] = self._normalize_instructions_field(instructions_data)
         
         # Update basic fields
         for attr, value in validated_data.items():

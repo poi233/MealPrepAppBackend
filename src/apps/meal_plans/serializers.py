@@ -1,6 +1,7 @@
 """
 Meal plan serializers for MealPrepAI Django backend.
 """
+import logging
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.utils import timezone
@@ -8,6 +9,8 @@ from datetime import datetime, date
 from apps.recipes.models import Recipe
 from apps.recipes.serializers import RecipeListSerializer
 from .models import MealPlan, MealPlanItem
+
+logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
@@ -21,7 +24,7 @@ class MealPlanItemSerializer(serializers.ModelSerializer):
         model = MealPlanItem
         fields = [
             'meal_plan', 'recipe', 'recipe_id', 'day_of_week', 
-            'meal_type', 'added_at'
+            'meal_type', 'serving_size', 'added_at'
         ]
         read_only_fields = ['added_at']
 
@@ -40,10 +43,27 @@ class MealPlanItemSerializer(serializers.ModelSerializer):
 
     def validate_recipe_id(self, value):
         """Validate that recipe exists."""
+        logger.info(f"[MealPlanItem] Validating recipe_id: {value}")
         try:
-            Recipe.objects.get(id=value)
+            recipe = Recipe.objects.get(id=value)
+            logger.info(f"[MealPlanItem] Recipe found: '{recipe.name}' (ID: {recipe.id})")
+            return value
         except Recipe.DoesNotExist:
-            raise serializers.ValidationError("Recipe not found")
+            logger.error(f"[MealPlanItem] Recipe not found for ID: {value}")
+            # Get available recipes for debugging
+            available_recipes = Recipe.objects.all()[:10]  # First 10 recipes
+            available_ids = [str(r.id) for r in available_recipes]
+            logger.error(f"[MealPlanItem] Available recipe IDs (first 10): {available_ids}")
+            
+            raise serializers.ValidationError(f"Recipe not found with ID: {value}. Please ensure the recipe exists before adding to meal plan.")
+
+    def validate_serving_size(self, value):
+        """Validate serving size."""
+        if value is not None:
+            if value < 0.1:
+                raise serializers.ValidationError("Serving size must be at least 0.1")
+            if value > 10.0:
+                raise serializers.ValidationError("Serving size cannot exceed 10.0")
         return value
 
 
@@ -64,10 +84,14 @@ class MealPlanSerializer(serializers.ModelSerializer):
 
     def validate_name(self, value):
         """Validate meal plan name."""
+        logger.info(f"[SaveTemplate] Validating name: '{value}'")
+        
         if not value or not value.strip():
+            logger.error(f"[SaveTemplate] Name validation failed: empty or whitespace-only name")
             raise serializers.ValidationError("Meal plan name is required")
         
         name = value.strip()[:255]
+        logger.info(f"[SaveTemplate] Cleaned name: '{name}'")
         
         # Check for duplicate names for the same user
         request = self.context.get('request')
@@ -77,8 +101,10 @@ class MealPlanSerializer(serializers.ModelSerializer):
                 queryset = queryset.exclude(pk=self.instance.pk)
             
             if queryset.exists():
+                logger.error(f"[SaveTemplate] Name validation failed: duplicate name '{name}' for user {request.user.id}")
                 raise serializers.ValidationError("You already have a meal plan with this name")
         
+        logger.info(f"[SaveTemplate] Name validation passed: '{name}'")
         return name
 
     def validate_description(self, value):
@@ -101,25 +127,35 @@ class MealPlanSerializer(serializers.ModelSerializer):
 
     def validate_week_start_date(self, value):
         """Validate week start date."""
+        logger.info(f"[SaveTemplate] Validating week_start_date: {value}")
+        
         if not value:
+            logger.error(f"[SaveTemplate] Week start date validation failed: missing value")
             raise serializers.ValidationError("Week start date is required")
         
         # Ensure it's a Monday (weekday 0)
         if value.weekday() != 0:
+            logger.error(f"[SaveTemplate] Week start date validation failed: {value} is not a Monday (weekday: {value.weekday()})")
             raise serializers.ValidationError("Week start date must be a Monday")
         
         # Don't allow dates too far in the past
         if value < date.today().replace(day=1) - timezone.timedelta(days=365):
+            logger.error(f"[SaveTemplate] Week start date validation failed: {value} is too far in the past")
             raise serializers.ValidationError("Week start date cannot be more than a year in the past")
         
+        logger.info(f"[SaveTemplate] Week start date validation passed: {value}")
         return value
 
     def validate(self, attrs):
         """Cross-field validation."""
+        logger.info(f"[SaveTemplate] Cross-field validation with attrs: {attrs}")
+        
         # If setting is_active to True, ensure no other meal plan is active for the same week
         if attrs.get('is_active', False):
             week_start_date = attrs.get('week_start_date')
             request = self.context.get('request')
+            
+            logger.info(f"[SaveTemplate] Checking active meal plan conflict for week: {week_start_date}")
             
             if week_start_date and request and hasattr(request, 'user'):
                 queryset = MealPlan.objects.filter(
@@ -132,10 +168,12 @@ class MealPlanSerializer(serializers.ModelSerializer):
                     queryset = queryset.exclude(pk=self.instance.pk)
                 
                 if queryset.exists():
+                    logger.error(f"[SaveTemplate] Cross-field validation failed: Another meal plan is already active for week {week_start_date}")
                     raise serializers.ValidationError({
                         'is_active': 'Another meal plan is already active for this week'
                     })
         
+        logger.info(f"[SaveTemplate] Cross-field validation passed")
         return attrs
 
     def create(self, validated_data):
@@ -176,7 +214,7 @@ class MealPlanItemCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = MealPlanItem
-        fields = ['recipe_id', 'day_of_week', 'meal_type']
+        fields = ['recipe_id', 'day_of_week', 'meal_type', 'serving_size']
 
     def validate_day_of_week(self, value):
         """Validate day of week."""
@@ -193,11 +231,19 @@ class MealPlanItemCreateSerializer(serializers.ModelSerializer):
 
     def validate_recipe_id(self, value):
         """Validate that recipe exists."""
+        logger.info(f"[MealPlanItemCreate] Validating recipe_id: {value}")
         try:
-            Recipe.objects.get(id=value)
+            recipe = Recipe.objects.get(id=value)
+            logger.info(f"[MealPlanItemCreate] Recipe found: '{recipe.name}' (ID: {recipe.id})")
+            return value
         except Recipe.DoesNotExist:
-            raise serializers.ValidationError("Recipe not found")
-        return value
+            logger.error(f"[MealPlanItemCreate] Recipe not found for ID: {value}")
+            # Get available recipes for debugging
+            available_recipes = Recipe.objects.all()[:10]  # First 10 recipes
+            available_ids = [str(r.id) for r in available_recipes]
+            logger.error(f"[MealPlanItemCreate] Available recipe IDs (first 10): {available_ids}")
+            
+            raise serializers.ValidationError(f"Recipe not found with ID: {value}. Please ensure the recipe exists before creating meal plan.")
 
 
 class MealPlanCreateSerializer(MealPlanSerializer):
@@ -264,6 +310,14 @@ class AddMealPlanItemSerializer(serializers.Serializer):
     recipe_id = serializers.UUIDField()
     day_of_week = serializers.IntegerField(min_value=0, max_value=6)
     meal_type = serializers.ChoiceField(choices=['breakfast', 'lunch', 'dinner', 'snack'])
+    serving_size = serializers.DecimalField(
+        max_digits=5, 
+        decimal_places=2, 
+        default=1.0,
+        min_value=0.1,
+        max_value=10.0,
+        required=False
+    )
 
     def validate_recipe_id(self, value):
         """Validate that recipe exists."""
@@ -307,7 +361,8 @@ class AddMealPlanItemSerializer(serializers.Serializer):
             meal_plan=meal_plan,
             recipe=recipe,
             day_of_week=self.validated_data['day_of_week'],
-            meal_type=self.validated_data['meal_type']
+            meal_type=self.validated_data['meal_type'],
+            serving_size=self.validated_data.get('serving_size', 1.0)
         )
         
         return item

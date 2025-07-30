@@ -91,12 +91,18 @@ class MealPlanViewSet(viewsets.ModelViewSet):
     def create(self, request):
         """Create a new meal plan with optional items."""
         try:
+            # Log the incoming request data for debugging
+            logger.info(f"[SaveTemplate] Creating meal plan for user {request.user.id}")
+            logger.info(f"[SaveTemplate] Request data: {request.data}")
+            logger.info(f"[SaveTemplate] Request content type: {request.content_type}")
+            logger.info(f"[SaveTemplate] Request method: {request.method}")
+            
             serializer = self.get_serializer(data=request.data, context={'request': request})
             
             if serializer.is_valid():
                 meal_plan = serializer.save()
                 
-                logger.info(f"Meal plan '{meal_plan.name}' created by user {request.user.id}")
+                logger.info(f"[SaveTemplate] Meal plan '{meal_plan.name}' created successfully by user {request.user.id}")
                 
                 # Return meal plan data without items for now to avoid composite key issues
                 response_serializer = MealPlanListSerializer(meal_plan, context={'request': request})
@@ -105,13 +111,19 @@ class MealPlanViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_201_CREATED
                 )
             
+            # Log detailed validation errors
+            logger.error(f"[SaveTemplate] Validation failed for user {request.user.id}")
+            logger.error(f"[SaveTemplate] Validation errors: {serializer.errors}")
+            logger.error(f"[SaveTemplate] Request data that failed validation: {request.data}")
+            
             return Response(
                 {'error': 'Validation failed', 'details': serializer.errors},
                 status=status.HTTP_400_BAD_REQUEST
             )
             
         except Exception as e:
-            logger.error(f"Error creating meal plan for user {request.user.id}: {str(e)}", exc_info=True)
+            logger.error(f"[SaveTemplate] Exception creating meal plan for user {request.user.id}: {str(e)}", exc_info=True)
+            logger.error(f"[SaveTemplate] Request data when exception occurred: {request.data}")
             return Response(
                 {'error': 'Failed to create meal plan'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR

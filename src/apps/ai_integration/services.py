@@ -5,7 +5,9 @@ import logging
 import json
 import asyncio
 import requests
-from typing import Dict, List, Any, Optional
+import uuid
+import hashlib
+from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime, date
 from django.conf import settings
@@ -14,8 +16,13 @@ from django.utils import timezone
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import time
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
+
+# UUID namespace for deterministic recipe IDs
+RECIPE_UUID_NAMESPACE = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
 
 
 @dataclass
@@ -45,6 +52,94 @@ class RecipeGenerationRequest:
     additional_requirements: Optional[str] = None
 
 
+def generate_deterministic_recipe_uuid(recipe_data: Dict[str, Any]) -> str:
+    """
+    Generate a deterministic UUID based on recipe content.
+    
+    This ensures that identical recipes always get the same ID,
+    enabling proper deduplication and frontend predictability.
+    
+    Args:
+        recipe_data: Dictionary containing recipe information
+        
+    Returns:
+        Deterministic UUID string
+    """
+    # Normalize and standardize recipe data for consistent hashing
+    normalized_data = _normalize_recipe_data_for_uuid(recipe_data)
+    
+    # Create content hash
+    content_string = json.dumps(normalized_data, sort_keys=True, ensure_ascii=False)
+    content_hash = hashlib.sha256(content_string.encode('utf-8')).hexdigest()
+    
+    # Generate deterministic UUID using namespace and content hash
+    deterministic_uuid = uuid.uuid5(RECIPE_UUID_NAMESPACE, content_hash)
+    
+    logger.debug(f"Generated deterministic UUID {deterministic_uuid} for recipe: {recipe_data.get('name', 'Unknown')}")
+    return str(deterministic_uuid)
+
+
+def _normalize_recipe_data_for_uuid(recipe_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize recipe data for consistent UUID generation.
+    
+    This function standardizes the recipe data to ensure that minor
+    variations (like whitespace, capitalization) don't create different UUIDs.
+    
+    Args:
+        recipe_data: Raw recipe data dictionary
+        
+    Returns:
+        Normalized dictionary for UUID generation
+    """
+    def normalize_string(s: str) -> str:
+        """Normalize a string by removing extra whitespace and converting to lowercase."""
+        if not isinstance(s, str):
+            return str(s)
+        return ' '.join(s.strip().lower().split())
+    
+    def normalize_ingredients(ingredients: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Normalize and sort ingredients list."""
+        if not isinstance(ingredients, list):
+            return []
+        
+        normalized_ingredients = []
+        for ing in ingredients:
+            if isinstance(ing, dict) and 'name' in ing and 'amount' in ing:
+                normalized_ingredients.append({
+                    'name': normalize_string(ing['name']),
+                    'amount': normalize_string(ing['amount'])
+                })
+        
+        # Sort ingredients by name for consistency
+        return sorted(normalized_ingredients, key=lambda x: x['name'])
+    
+    def normalize_instructions(instructions: List[str]) -> List[str]:
+        """Normalize instructions list."""
+        if not isinstance(instructions, list):
+            return []
+        
+        normalized_instructions = []
+        for inst in instructions:
+            if isinstance(inst, str) and inst.strip():
+                normalized_instructions.append(normalize_string(inst))
+        
+        return normalized_instructions
+    
+    # Extract and normalize key fields that define recipe uniqueness
+    normalized = {
+        'name': normalize_string(recipe_data.get('name', '')),
+        'ingredients': normalize_ingredients(recipe_data.get('ingredients', [])),
+        'cuisine': normalize_string(recipe_data.get('cuisine', '')),
+        'difficulty': normalize_string(recipe_data.get('difficulty', '')),
+        # Instructions are included but with less weight since they might vary more
+        'instructions_key': '|'.join(normalize_instructions(recipe_data.get('instructions', []))),
+    }
+    
+    # Only include non-empty values to avoid UUID changes due to missing vs empty fields
+    return {k: v for k, v in normalized.items() if v}
+
+
 class AIService:
     """Service class for AI integrations using Google Gemini."""
     
@@ -53,6 +148,17 @@ class AIService:
         self._initialize_gemini()
         self._rate_limit_cache_key = "ai_service_rate_limit"
         self._max_requests_per_minute = 60  # Adjust based on your API limits
+        
+        # Concurrency control settings
+        self._max_concurrent_recipes = 5  # Maximum concurrent recipe generations
+        self._recipe_generation_semaphore = asyncio.Semaphore(self._max_concurrent_recipes)
+        
+        # Content validation settings
+        self._max_text_length = 2000  # Maximum length for text fields
+        self._max_ingredient_name_length = 100
+        self._max_instruction_length = 500
+        self._max_ingredients_count = 50
+        self._max_instructions_count = 20
     
     def _initialize_gemini(self):
         """Initialize Google Gemini AI client."""
@@ -91,6 +197,122 @@ class AIService:
         cache.set(cache_key, current_count + 1, 60)  # Expire after 1 minute
         return True
     
+    def _validate_ai_content(self, content: Dict[str, Any]) -> Tuple[bool, str]:
+        """Validate AI-generated content for security and length constraints."""
+        try:
+            # Validate recipe name (optional since it comes from request)
+            name = content.get('name', '')
+            if name and not isinstance(name, str):
+                return False, "Recipe name must be a string"
+            if name and len(name) > self._max_text_length:
+                return False, f"Recipe name too long (max {self._max_text_length} chars)"
+            
+            # Validate description
+            description = content.get('description', '')
+            if description and len(description) > self._max_text_length:
+                return False, f"Description too long (max {self._max_text_length} chars)"
+            
+            # Validate ingredients
+            ingredients = content.get('ingredients', [])
+            if not isinstance(ingredients, list):
+                return False, "Ingredients must be a list"
+            if len(ingredients) > self._max_ingredients_count:
+                return False, f"Too many ingredients (max {self._max_ingredients_count})"
+            
+            for i, ingredient in enumerate(ingredients):
+                if not isinstance(ingredient, dict):
+                    return False, f"Ingredient {i} must be an object"
+                
+                ing_name = ingredient.get('name', '')
+                ing_amount = ingredient.get('amount', '')
+                
+                if not isinstance(ing_name, str) or not ing_name.strip():
+                    return False, f"Ingredient {i} name is required"
+                if len(ing_name) > self._max_ingredient_name_length:
+                    return False, f"Ingredient {i} name too long"
+                
+                if not isinstance(ing_amount, str) or not ing_amount.strip():
+                    return False, f"Ingredient {i} amount is required"
+                if len(ing_amount) > self._max_ingredient_name_length:
+                    return False, f"Ingredient {i} amount too long"
+                
+                # Basic security check for malicious content
+                if self._contains_suspicious_content(ing_name) or self._contains_suspicious_content(ing_amount):
+                    return False, f"Ingredient {i} contains suspicious content"
+            
+            # Validate instructions
+            instructions = content.get('instructions', [])
+            if not isinstance(instructions, list):
+                return False, "Instructions must be a list"
+            if len(instructions) > self._max_instructions_count:
+                return False, f"Too many instructions (max {self._max_instructions_count})"
+            
+            for i, instruction in enumerate(instructions):
+                if not isinstance(instruction, str) or not instruction.strip():
+                    return False, f"Instruction {i} must be a non-empty string"
+                if len(instruction) > self._max_instruction_length:
+                    return False, f"Instruction {i} too long (max {self._max_instruction_length} chars)"
+                
+                # Basic security check for malicious content
+                if self._contains_suspicious_content(instruction):
+                    return False, f"Instruction {i} contains suspicious content"
+            
+            return True, "Content validation passed"
+            
+        except Exception as e:
+            self.logger.error(f"Error validating AI content: {str(e)}")
+            return False, f"Content validation error: {str(e)}"
+    
+    def _contains_suspicious_content(self, text: str) -> bool:
+        """Check for suspicious content in text."""
+        # Basic patterns to detect potentially malicious content
+        suspicious_patterns = [
+            r'<script[^>]*>.*?</script>',  # Script tags
+            r'javascript:',  # JavaScript URLs
+            r'on\w+\s*=',  # Event handlers
+            r'\$\{.*?\}',  # Template injection patterns
+            r'{{.*?}}',  # Template injection patterns
+            r'<%.*?%>',  # Server-side template patterns
+        ]
+        
+        text_lower = text.lower()
+        for pattern in suspicious_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE | re.DOTALL):
+                return True
+        
+        return False
+    
+    def _classify_exception(self, exception: Exception) -> Tuple[str, bool, int]:
+        """Classify exception type and determine retry strategy.
+        
+        Returns:
+            Tuple[exception_type, should_retry, retry_delay_seconds]
+        """
+        if isinstance(exception, json.JSONDecodeError):
+            return "json_decode_error", False, 0
+        elif isinstance(exception, KeyError):
+            return "key_error", False, 0
+        elif isinstance(exception, requests.exceptions.ConnectionError):
+            return "connection_error", True, 5
+        elif isinstance(exception, requests.exceptions.Timeout):
+            return "timeout_error", True, 3
+        elif isinstance(exception, requests.exceptions.HTTPError):
+            status_code = getattr(exception.response, 'status_code', 0) if hasattr(exception, 'response') else 0
+            if status_code >= 500:
+                return "server_error", True, 10
+            elif status_code == 429:
+                return "rate_limit_error", True, 30
+            else:
+                return "http_error", False, 0
+        elif isinstance(exception, requests.exceptions.RequestException):
+            return "request_error", True, 5
+        elif "rate limit" in str(exception).lower():
+            return "ai_rate_limit_error", True, 60
+        elif "safety" in str(exception).lower() or "blocked" in str(exception).lower():
+            return "content_safety_error", False, 0
+        else:
+            return "unknown_error", False, 0
+    
     async def _generate_content_with_retry(self, prompt: str, max_retries: int = 3) -> str:
         """Generate content with retry logic and rate limiting."""
         if not self._check_rate_limit():
@@ -115,15 +337,119 @@ class AIService:
                     raise Exception("Empty response from AI model")
                     
             except Exception as e:
-                self.logger.warning(f"AI generation attempt {attempt + 1} failed: {str(e)}")
-                if attempt == max_retries - 1:
+                exception_type, should_retry, retry_delay = self._classify_exception(e)
+                
+                self.logger.warning(
+                    f"AI generation attempt {attempt + 1} failed with {exception_type}: {str(e)}"
+                )
+                
+                if attempt == max_retries - 1 or not should_retry:
+                    self.logger.error(f"Final attempt failed for {exception_type}: {str(e)}")
                     raise
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                
+                # Use classified retry delay or exponential backoff
+                delay = retry_delay if retry_delay > 0 else (2 ** attempt)
+                await asyncio.sleep(delay)
         
         raise Exception("Failed to generate content after all retries")
     
+    async def _generate_recipes_batch(self, recipe_requests: List[Tuple[Dict[str, Any], str, Any]]) -> List[Dict[str, Any]]:
+        """Generate multiple recipes concurrently with controlled concurrency.
+        
+        Args:
+            recipe_requests: List of tuples (basic_recipe, meal_type, user)
+            
+        Returns:
+            List of detailed recipe dictionaries
+        """
+        async def generate_single_recipe_with_semaphore(basic_recipe: Dict[str, Any], meal_type: str, user) -> Dict[str, Any]:
+            """Generate a single recipe with semaphore control."""
+            async with self._recipe_generation_semaphore:
+                try:
+                    # Create RecipeGenerationRequest
+                    recipe_request = RecipeGenerationRequest(
+                        name=basic_recipe['name'],
+                        description=basic_recipe.get('description'),
+                        cuisine=basic_recipe.get('cuisine'),
+                        meal_type=meal_type
+                    )
+                    
+                    # Generate detailed recipe
+                    recipe_result = await self.generate_recipe_details(recipe_request, user)
+                    
+                    if recipe_result.get('success') and recipe_result.get('recipe'):
+                        detailed_recipe = recipe_result['recipe']
+                        
+                        # Validate AI-generated content
+                        is_valid, validation_message = self._validate_ai_content(detailed_recipe)
+                        if not is_valid:
+                            self.logger.warning(f"Recipe validation failed for {basic_recipe['name']}: {validation_message}")
+                            # Create fallback instead of using invalid content
+                            return self._create_smart_fallback_recipe(basic_recipe, meal_type)
+                        
+                        # Generate deterministic UUID for the recipe based on content
+                        recipe_id = generate_deterministic_recipe_uuid(detailed_recipe)
+                        
+                        # Convert to the format expected by iOS
+                        formatted_recipe = {
+                            'id': recipe_id,
+                            'name': detailed_recipe['name'],
+                            'description': detailed_recipe['description'],
+                            'ingredients': detailed_recipe['ingredients'],
+                            'instructions': detailed_recipe['instructions'],
+                            'nutrition_info': detailed_recipe['nutrition_info'],
+                            'cuisine': detailed_recipe['cuisine'],
+                            'prep_time': detailed_recipe['prep_time'],
+                            'cook_time': detailed_recipe['cook_time'],
+                            'difficulty': detailed_recipe['difficulty'],
+                            'avg_rating': 0.0,
+                            'rating_count': 0,
+                            'image_url': detailed_recipe['image_url'],
+                            'tags': detailed_recipe['tags'],
+                            'created_by_user': 'AI Assistant',
+                            'created_by_user_id': 'ai-generated',
+                            'created_at': datetime.now().isoformat(),
+                            'updated_at': datetime.now().isoformat()
+                        }
+                        return formatted_recipe
+                    else:
+                        self.logger.warning(f"Failed to generate detailed recipe for: {basic_recipe['name']}")
+                        return self._create_smart_fallback_recipe(basic_recipe, meal_type)
+                        
+                except Exception as e:
+                    exception_type, should_retry, retry_delay = self._classify_exception(e)
+                    self.logger.error(
+                        f"Error generating detailed recipe for {basic_recipe['name']} ({exception_type}): {str(e)}"
+                    )
+                    return self._create_smart_fallback_recipe(basic_recipe, meal_type)
+        
+        # Execute all recipe generations concurrently with semaphore control
+        tasks = [
+            generate_single_recipe_with_semaphore(basic_recipe, meal_type, user)
+            for basic_recipe, meal_type, user in recipe_requests
+        ]
+        
+        self.logger.info(f"Starting batch generation of {len(tasks)} recipes with max concurrency {self._max_concurrent_recipes}")
+        detailed_recipes = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Filter out exceptions and log them
+        valid_recipes = []
+        for i, result in enumerate(detailed_recipes):
+            if isinstance(result, Exception):
+                basic_recipe = recipe_requests[i][0]
+                meal_type = recipe_requests[i][1]
+                self.logger.error(f"Recipe generation completely failed for {basic_recipe['name']}: {str(result)}")
+                # Create emergency fallback
+                fallback = self._create_smart_fallback_recipe(basic_recipe, meal_type)
+                valid_recipes.append(fallback)
+            else:
+                valid_recipes.append(result)
+        
+        self.logger.info(f"Completed batch generation: {len(valid_recipes)} recipes generated")
+        return valid_recipes
+    
     async def _generate_recipe_with_retry(self, prompt: str, max_retries: int = 3) -> Dict[str, Any]:
-        """Generate recipe content with retry logic including JSON parsing validation."""
+        """Generate recipe content with retry logic including JSON parsing validation and enhanced error handling."""
         if not self._check_rate_limit():
             raise Exception("Rate limit exceeded. Please try again later.")
         
@@ -145,13 +471,28 @@ class AIService:
                 
                 # Try to parse the response
                 recipe_data = self._parse_recipe_details_response(response.text.strip())
+                
+                # Validate the parsed content
+                is_valid, validation_message = self._validate_ai_content(recipe_data)
+                if not is_valid:
+                    raise Exception(f"Content validation failed: {validation_message}")
+                
                 return recipe_data
                     
             except Exception as e:
-                self.logger.warning(f"Recipe generation attempt {attempt + 1} failed: {str(e)}")
-                if attempt == max_retries - 1:
-                    raise Exception(f"Failed to generate valid recipe after {max_retries} attempts: {str(e)}")
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                exception_type, should_retry, retry_delay = self._classify_exception(e)
+                
+                self.logger.warning(
+                    f"Recipe generation attempt {attempt + 1} failed with {exception_type}: {str(e)}"
+                )
+                
+                if attempt == max_retries - 1 or not should_retry:
+                    self.logger.error(f"Final recipe generation attempt failed for {exception_type}: {str(e)}")
+                    raise Exception(f"Failed to generate valid recipe after {max_retries} attempts ({exception_type}): {str(e)}")
+                
+                # Use classified retry delay or exponential backoff
+                delay = retry_delay if retry_delay > 0 else (2 ** attempt)
+                await asyncio.sleep(delay)
         
         raise Exception("Failed to generate valid recipe after all retries")
     
@@ -175,17 +516,27 @@ class AIService:
             # Generate content using Gemini
             response_text = await self._generate_content_with_retry(prompt)
             
-            # Parse the JSON response
-            meal_plan_data = self._parse_meal_plan_response(response_text)
+            # Parse the JSON response and generate detailed recipes
+            meal_plan_data = await self._parse_meal_plan_response(response_text, user)
+            
+            # Get the processed daily meals (already formatted for iOS compatibility)
+            processed_daily_meals = meal_plan_data.get('weeklyMealPlan', [])
             
             # Create the final meal plan structure
             meal_plan = {
+                'id': f'ai-generated-{user.id}-{datetime.now().strftime("%Y%m%d%H%M%S")}',
+                'user_id': str(user.id),
                 'name': f'AI Generated Plan - {datetime.now().strftime("%Y-%m-%d")}',
                 'description': 'AI-generated healthy meal plan',
                 'week_start_date': request.week_start_date or date.today(),
+                'is_active': False,
                 'plan_description': request.plan_description,
                 'analysis_text': self._generate_analysis_text(request),
-                'daily_meals': meal_plan_data.get('weeklyMealPlan', [])
+                'items': None,  # AI generated plans don't have items initially
+                'items_count': 0,
+                'daily_meals': processed_daily_meals,
+                'created_at': datetime.now(),
+                'updated_at': datetime.now()
             }
             
             result = {
@@ -197,6 +548,8 @@ class AIService:
             cache.set(cache_key, result, 3600)
             
             self.logger.info(f"Successfully generated meal plan for user {user.id}")
+            self.logger.info(f"[DEBUG] Generated meal plan structure: {meal_plan}")
+            self.logger.info(f"[DEBUG] Sample daily meal from response: {meal_plan_data.get('weeklyMealPlan', [{}])[0] if meal_plan_data.get('weeklyMealPlan') else 'No daily meals'}")
             return result
             
         except Exception as e:
@@ -205,6 +558,8 @@ class AIService:
                 'success': False,
                 'error': f'Failed to generate meal plan: {str(e)}'
             }
+    
+
     
     async def generate_recipe_details(self, request: RecipeGenerationRequest, user) -> Dict[str, Any]:
         """
@@ -321,55 +676,68 @@ class AIService:
             }
     
     def _build_meal_plan_prompt(self, request: MealPlanRequest) -> str:
-        """Build the prompt for meal plan generation using the same format as Next.js."""
-        return f"""你是一位专业的膳食计划AI。你的任务是根据用户提供的计划描述生成一个7天的膳食计划。
-输出必须是有效的JSON对象。所有文本内容（星期、食谱名称、配料、步骤）都应该是中文。
+        """Build the prompt for simplified meal plan generation with recipe names only."""
+        dietary_preferences_text = ""
+        if request.dietary_preferences:
+            dietary_preferences_text = f"\n饮食偏好: {request.dietary_preferences}"
+        
+        allergies_text = ""
+        if request.allergies:
+            allergies_text = f"\n过敏原: {', '.join(request.allergies)}"
+        
+        dislikes_text = ""
+        if request.dislikes:
+            dislikes_text = f"\n不喜欢的食物: {', '.join(request.dislikes)}"
+        
+        calorie_text = ""
+        if request.calorie_target:
+            calorie_text = f"\n每日卡路里目标: {request.calorie_target}千卡"
+        
+        additional_text = ""
+        if request.additional_requirements:
+            additional_text = f"\n额外要求: {request.additional_requirements}"
+        
+        return f"""你是一位专业的膳食计划AI。根据用户描述生成7天膳食计划，只需要食谱名称和基本信息。
+输出必须是有效的JSON对象，所有文本内容用中文。
 
-用户计划描述: {request.plan_description}
+用户计划描述: {request.plan_description}{dietary_preferences_text}{allergies_text}{dislikes_text}{calorie_text}{additional_text}
 
-请生成一个JSON对象，其顶层键为 "weeklyMealPlan"。
-"weeklyMealPlan" 的值应该是一个包含7个对象的数组，每周的每一天（例如，"星期一"，"星期二"，...，"星期日"）一个对象。
+要求：
+1. 只生成食谱名称和基本信息，不需要详细配料和步骤
+2. 所有内容用中文
+3. 食谱名称要具体且有吸引力
+4. 考虑营养均衡和多样性
 
-每个每日对象必须包含以下键：
-- "day": 字符串，表示星期几。
-- "breakfast": 早餐膳食对象的数组。此数组可以包含1-2个食谱。如果未计划早餐，则提供一个空数组。
-- "lunch": 午餐膳食对象的数组。此数组可以包含1-2个食谱。如果未计划午餐，则提供一个空数组。
-- "dinner": 晚餐膳食对象的数组。此数组可以包含1-2个食谱。如果未计划晚餐，则提供一个空数组。
-
-"breakfast"、"lunch" 或 "dinner" 数组中的每个膳食对象必须包含以下键：
-- "recipeName": 字符串，食谱的名称（例如，"牛油果吐司"，"扒鸡胸沙拉"）。
-- "ingredients": 字符串数组。每个字符串应为一个详细的配料，包括具体的数量和单位（例如，"中筋面粉 1杯"，"白砂糖 1/2杯"，"2个 大鸡蛋，轻微打散"，"1个 中等大小洋葱，切碎"）。
-- "instructions": 详细说明全面、分步的准备说明的字符串。包括适用的烹饪时间和温度。使用Markdown格式化步骤（例如，编号列表，**粗体**高亮关键操作）。
-
-单个膳食对象示例：
+输出JSON格式：
 {{
-  "recipeName": "经典薄煎饼",
-  "ingredients": [
-    "中筋面粉 1又1/2杯",
-    "泡打粉 3又1/2茶匙",
-    "盐 1茶匙",
-    "白砂糖 1汤匙",
-    "牛奶 1又1/4杯",
-    "鸡蛋 1个",
-    "融化黄油 3汤匙"
-  ],
-  "instructions": "1. **准备面糊**: 在一个大碗里，将面粉、泡打粉、盐和糖筛在一起。\\n2. 在中心挖一个坑，倒入牛奶、鸡蛋和融化的黄油；搅拌至顺滑，不要过度搅拌。\\n3. **煎制**: 用中高火加热轻微涂油的煎锅或平底锅。当锅热时，每个薄煎饼约用1/4杯面糊倒入锅中。\\n4. **翻面**: 煎约2-3分钟，直到表面出现气泡且边缘凝固。翻面再煎1-2分钟，或至两面金黄。\\n5. **享用**: 趁热与您喜欢的配料（如枫糖浆、水果或奶油）一起享用。"
-}}
-
-确保所有字符串值都已为JSON正确转义。例如，一天的计划可能如下所示：
-{{
-  "day": "星期一",
-  "breakfast": [
-    {{ "recipeName": "燕麦粥加浆果", "ingredients": ["燕麦片 1/2杯", "水或牛奶 1杯", "混合浆果 1/2杯", "蜂蜜 1汤匙（可选）"], "instructions": "1. 将燕麦和水/牛奶在锅中混合。煮沸。\\n2. 转小火煮3-5分钟，偶尔搅拌，直至浓稠。\\n3. 如果需要，拌入浆果和蜂蜜。趁热食用。" }}
-  ],
-  "lunch": [
-    {{ "recipeName": "烤鸡胸肉", "ingredients": ["去骨去皮鸡胸肉 1块（约150克）", "橄榄油 1汤匙", "盐 1/2茶匙", "黑胡椒 1/4茶匙", "辣椒粉 1/4茶匙"], "instructions": "1. **预热**: 将烤架或烤盘预热至中高火。\\n2. **调味**: 在鸡胸肉上涂抹橄榄油，并用盐、胡椒和辣椒粉调味。\\n3. **烤制**: 每面烤6-8分钟，或直至内部温度达到165°F（74°C）。\\n4. **静置**: 烤好后静置5分钟后再切片，以保持肉质鲜嫩。" }},
-    {{ "recipeName": "简易沙拉", "ingredients": ["混合生菜叶 2杯", "黄瓜 1/4根，切片", "小番茄 4-5个，对半切", "油醋汁 1汤匙"], "instructions": "1. 在碗中混合生菜叶、黄瓜片和小番茄丁。\\n2. 淋上油醋汁，轻轻拌匀即可。" }}
-  ],
-  "dinner": [
-    {{ "recipeName": "三文鱼配烤芦笋", "ingredients": ["三文鱼柳 1块（约150克）", "芦笋 1把，修剪", "橄榄油 1汤匙", "柠檬汁 1/2个量", "盐和胡椒 适量"], "instructions": "1. **预热烤箱**: 将烤箱预热至400°F（200°C）。\\n2. **准备蔬菜**: 将芦笋与1/2汤匙橄榄油、盐和胡椒拌匀。铺在烤盘上。\\n3. **准备三文鱼**: 在三文鱼柳上涂抹剩余的橄榄油、柠檬汁、盐和胡椒。放在同一烤盘上。\\n4. **烤制**: 烤12-15分钟，或直至三文鱼熟透，芦笋变软脆。" }}
+  "weeklyMealPlan": [
+    {{
+      "day": "星期一",
+      "breakfast": [食谱基本信息数组],
+      "lunch": [食谱基本信息数组],
+      "dinner": [食谱基本信息数组]
+    }},
+    ... (共7天)
   ]
 }}
+
+每个食谱对象只需包含：
+{{
+  "name": "具体的食谱名称，如'香煎三文鱼配柠檬芦笋'",
+  "description": "简短描述，15-20字",
+  "cuisine": "菜系，如'中式'、'西式'、'日式'等",
+  "meal_type": "breakfast/lunch/dinner"
+}}
+
+重要：
+- 确保JSON语法正确
+- 每天包含早餐、午餐、晚餐
+- 每餐通常1个食谱，特殊情况可以2个
+- 食谱名称要具体，不要太笼统
+- 一周内避免重复食谱
+- 考虑营养搭配和口味多样性
+
+请生成完整的7天膳食计划JSON。
 确保您的整个响应是一个以 {{ 开始并以 }} 结束的JSON对象。"""
 
     def _build_recipe_details_prompt(self, request: RecipeGenerationRequest) -> str:
@@ -401,6 +769,7 @@ class AIService:
 
 请严格按照以下JSON格式输出：
 {{
+  "name": "{request.name}",
   "description": "香嫩可口的家常鸡肉料理，营养丰富",
   "cuisine": "中式",
   "difficulty": "中等",
@@ -455,8 +824,8 @@ class AIService:
 
 确保输出格式为有效的JSON。"""
 
-    def _parse_meal_plan_response(self, response_text: str) -> Dict[str, Any]:
-        """Parse the meal plan response from Gemini."""
+    async def _parse_meal_plan_response(self, response_text: str, user) -> Dict[str, Any]:
+        """Parse the meal plan response from Gemini and generate detailed recipes using batch processing."""
         try:
             # Clean up the response text
             response_text = response_text.strip()
@@ -479,33 +848,92 @@ class AIService:
                     json_content = response_text
             
             # Parse JSON
-            data = json.loads(json_content)
+            try:
+                data = json.loads(json_content)
+            except json.JSONDecodeError as e:
+                self.logger.error(f"Failed to parse meal plan JSON response: {str(e)}")
+                self.logger.error(f"JSON content being parsed: {json_content[:1000]}...")  # First 1000 chars
+                
+                # Try to fix common JSON issues
+                try:
+                    fixed_json = self._fix_json_syntax(json_content)
+                    data = json.loads(fixed_json)
+                    self.logger.info("Successfully fixed and parsed JSON after syntax error")
+                except Exception as fix_error:
+                    self.logger.error(f"Failed to fix JSON syntax: {str(fix_error)}")
+                    raise Exception("Invalid JSON response from AI model")
             
             # Validate and clean the data
             if 'weeklyMealPlan' in data and isinstance(data['weeklyMealPlan'], list):
                 # Ensure we have 7 days
                 if len(data['weeklyMealPlan']) == 7:
-                    # Validate each day
-                    for day_plan in data['weeklyMealPlan']:
+                    # Collect all recipe generation requests for batch processing
+                    recipe_requests = []
+                    day_meal_mapping = []  # Track which day/meal each recipe belongs to
+                    
+                    for day_idx, day_plan in enumerate(data['weeklyMealPlan']):
                         if not isinstance(day_plan, dict):
                             continue
                         
-                        # Ensure required fields exist
+                        # Process each meal type
                         for meal_type in ['breakfast', 'lunch', 'dinner']:
                             if meal_type not in day_plan:
                                 day_plan[meal_type] = []
                             elif not isinstance(day_plan[meal_type], list):
                                 day_plan[meal_type] = []
                             else:
-                                # Filter out invalid meals
-                                day_plan[meal_type] = [
+                                # Filter valid basic recipes
+                                valid_basic_recipes = [
                                     meal for meal in day_plan[meal_type]
                                     if (isinstance(meal, dict) and 
-                                        'recipeName' in meal and 
-                                        'ingredients' in meal and 
-                                        'instructions' in meal and
-                                        isinstance(meal['ingredients'], list))
+                                        'name' in meal and 
+                                        isinstance(meal['name'], str) and
+                                        meal['name'].strip())
                                 ]
+                                
+                                # Add to batch processing list
+                                for basic_recipe in valid_basic_recipes:
+                                    recipe_requests.append((basic_recipe, meal_type, user))
+                                    day_meal_mapping.append((day_idx, meal_type))
+                    
+                    # Generate all recipes concurrently using batch processing
+                    self.logger.info(f"Processing {len(recipe_requests)} recipes using batch generation")
+                    
+                    if recipe_requests:
+                        detailed_recipes = await self._generate_recipes_batch(recipe_requests)
+                        
+                        # Map the generated recipes back to their respective days and meals
+                        recipe_index = 0
+                        for day_idx, day_plan in enumerate(data['weeklyMealPlan']):
+                            if not isinstance(day_plan, dict):
+                                continue
+                                
+                            for meal_type in ['breakfast', 'lunch', 'dinner']:
+                                if meal_type in day_plan and isinstance(day_plan[meal_type], list):
+                                    valid_basic_recipes = [
+                                        meal for meal in day_plan[meal_type]
+                                        if (isinstance(meal, dict) and 
+                                            'name' in meal and 
+                                            isinstance(meal['name'], str) and
+                                            meal['name'].strip())
+                                    ]
+                                    
+                                    # Replace with detailed recipes
+                                    meal_detailed_recipes = []
+                                    for _ in valid_basic_recipes:
+                                        if recipe_index < len(detailed_recipes):
+                                            meal_detailed_recipes.append(detailed_recipes[recipe_index])
+                                            recipe_index += 1
+                                    
+                                    day_plan[meal_type] = meal_detailed_recipes
+                                else:
+                                    day_plan[meal_type] = []
+                    else:
+                        # No valid recipes found, ensure empty arrays
+                        for day_plan in data['weeklyMealPlan']:
+                            if isinstance(day_plan, dict):
+                                for meal_type in ['breakfast', 'lunch', 'dinner']:
+                                    day_plan[meal_type] = []
                     
                     return data
             
@@ -522,13 +950,336 @@ class AIService:
                 ]
             }
             
-        except json.JSONDecodeError as e:
-            self.logger.error(f"Failed to parse meal plan JSON response: {str(e)}")
-            self.logger.error(f"Response text: {response_text}")
-            raise Exception("Invalid JSON response from AI model")
         except Exception as e:
-            self.logger.error(f"Error parsing meal plan response: {str(e)}")
+            exception_type, should_retry, retry_delay = self._classify_exception(e)
+            self.logger.error(f"Error parsing meal plan response ({exception_type}): {str(e)}")
             raise
+    
+    def _create_smart_fallback_recipe(self, basic_recipe: Dict[str, Any], meal_type: str) -> Dict[str, Any]:
+        """Create an intelligent fallback recipe based on recipe name analysis."""
+        recipe_name = basic_recipe.get('name', 'Unknown Recipe')
+        cuisine = basic_recipe.get('cuisine', '中式')
+        
+        # Analyze recipe name to determine likely ingredients and cooking method
+        smart_ingredients = self._analyze_recipe_name_for_ingredients(recipe_name, meal_type, cuisine)
+        smart_instructions = self._analyze_recipe_name_for_instructions(recipe_name, meal_type, cuisine)
+        smart_description = self._generate_smart_description(recipe_name, cuisine)
+        estimated_times = self._estimate_cooking_times(recipe_name, meal_type)
+        
+        # Create recipe data structure for deterministic UUID generation
+        recipe_data_for_uuid = {
+            'name': recipe_name,
+            'ingredients': smart_ingredients,
+            'instructions': smart_instructions,
+            'cuisine': cuisine,
+            'difficulty': self._estimate_difficulty(recipe_name)
+        }
+        
+        # Generate deterministic UUID based on recipe content
+        recipe_id = generate_deterministic_recipe_uuid(recipe_data_for_uuid)
+        
+        return {
+            'id': recipe_id,
+            'name': recipe_name,
+            'description': smart_description,
+            'ingredients': smart_ingredients,
+            'instructions': smart_instructions,
+            'nutrition_info': self._generate_mock_nutrition(),
+            'cuisine': cuisine,
+            'prep_time': estimated_times['prep_time'],
+            'cook_time': estimated_times['cook_time'],
+            'difficulty': self._estimate_difficulty(recipe_name),
+            'avg_rating': 0.0,
+            'rating_count': 0,
+            'image_url': self._get_fallback_image_url(),
+            'tags': self._generate_smart_tags(recipe_name, meal_type, cuisine),
+            'created_by_user': 'AI Assistant',
+            'created_by_user_id': 'ai-generated-smart-fallback',
+            'created_at': datetime.now().isoformat(),
+            'updated_at': datetime.now().isoformat()
+        }
+    
+    def _analyze_recipe_name_for_ingredients(self, recipe_name: str, meal_type: str, cuisine: str) -> List[Dict[str, str]]:
+        """Analyze recipe name to predict likely ingredients."""
+        ingredients = []
+        name_lower = recipe_name.lower()
+        
+        # Basic seasonings always included
+        ingredients.extend([
+            {'name': '盐', 'amount': '适量'},
+            {'name': '食用油', 'amount': '1汤匙'}
+        ])
+        
+        # Protein detection
+        if any(protein in name_lower for protein in ['鸡', '鸡肉', 'chicken']):
+            ingredients.append({'name': '鸡肉', 'amount': '150克'})
+        elif any(protein in name_lower for protein in ['猪', '猪肉', 'pork']):
+            ingredients.append({'name': '猪肉', 'amount': '150克'})
+        elif any(protein in name_lower for protein in ['牛', '牛肉', 'beef']):
+            ingredients.append({'name': '牛肉', 'amount': '150克'})
+        elif any(protein in name_lower for protein in ['鱼', 'fish', '三文鱼', 'salmon']):
+            ingredients.append({'name': '鱼肉', 'amount': '150克'})
+        elif any(protein in name_lower for protein in ['虾', 'shrimp']):
+            ingredients.append({'name': '虾', 'amount': '200克'})
+        elif any(protein in name_lower for protein in ['蛋', 'egg']):
+            ingredients.append({'name': '鸡蛋', 'amount': '2个'})
+        elif any(protein in name_lower for protein in ['豆腐', 'tofu']):
+            ingredients.append({'name': '豆腐', 'amount': '200克'})
+        
+        # Vegetable detection
+        if any(veg in name_lower for veg in ['西红柿', '番茄', 'tomato']):
+            ingredients.append({'name': '西红柿', 'amount': '2个'})
+        elif any(veg in name_lower for veg in ['土豆', 'potato']):
+            ingredients.append({'name': '土豆', 'amount': '1个'})
+        elif any(veg in name_lower for veg in ['胡萝卜', 'carrot']):
+            ingredients.append({'name': '胡萝卜', 'amount': '1根'})
+        elif any(veg in name_lower for veg in ['洋葱', 'onion']):
+            ingredients.append({'name': '洋葱', 'amount': '半个'})
+        elif any(veg in name_lower for veg in ['青椒', 'pepper']):
+            ingredients.append({'name': '青椒', 'amount': '1个'})
+        elif any(veg in name_lower for veg in ['芦笋', 'asparagus']):
+            ingredients.append({'name': '芦笋', 'amount': '200克'})
+        
+        # Grain/starch detection
+        if any(grain in name_lower for grain in ['米饭', 'rice', '饭']):
+            ingredients.append({'name': '大米', 'amount': '80克'})
+        elif any(grain in name_lower for grain in ['面条', 'noodle', '面']):
+            ingredients.append({'name': '面条', 'amount': '100克'})
+        elif any(grain in name_lower for grain in ['面包', 'bread']):
+            ingredients.append({'name': '面包', 'amount': '2片'})
+        
+        # Add cuisine-specific ingredients
+        if cuisine == '中式':
+            ingredients.extend([
+                {'name': '生抽', 'amount': '1汤匙'},
+                {'name': '料酒', 'amount': '1茶匙'},
+                {'name': '大蒜', 'amount': '2瓣'}
+            ])
+        elif cuisine == '西式':
+            ingredients.extend([
+                {'name': '黑胡椒', 'amount': '适量'},
+                {'name': '百里香', 'amount': '少许'}
+            ])
+        elif cuisine == '日式':
+            ingredients.extend([
+                {'name': '味噌', 'amount': '1汤匙'},
+                {'name': '海苔', 'amount': '适量'}
+            ])
+        
+        # Add meal-type specific ingredients
+        if meal_type == 'breakfast' and not any('蛋' in ing['name'] for ing in ingredients):
+            ingredients.append({'name': '鸡蛋', 'amount': '1个'})
+        
+        return ingredients
+    
+    def _analyze_recipe_name_for_instructions(self, recipe_name: str, meal_type: str, cuisine: str) -> List[str]:
+        """Generate cooking instructions based on recipe name analysis."""
+        name_lower = recipe_name.lower()
+        instructions = []
+        
+        # Prep step
+        instructions.append('准备所有食材，清洗干净并按需切好')
+        
+        # Cooking method detection
+        if any(method in name_lower for method in ['炒', 'stir', 'fry']):
+            instructions.extend([
+                '热锅下油，油温6成热时下入主要食材',
+                '大火快炒2-3分钟至食材断生',
+                '加入调料炒匀，继续炒制1-2分钟'
+            ])
+        elif any(method in name_lower for method in ['煮', 'boil', '汤']):
+            instructions.extend([
+                '锅中加入适量清水，大火烧开',
+                '放入主要食材，转中火煮10-15分钟',
+                '调味后再煮5分钟即可'
+            ])
+        elif any(method in name_lower for method in ['蒸', 'steam']):
+            instructions.extend([
+                '蒸锅加水烧开，将食材放入蒸屉',
+                '大火蒸15-20分钟至熟透',
+                '取出后淋上调料汁即可'
+            ])
+        elif any(method in name_lower for method in ['烤', 'bake', 'roast']):
+            instructions.extend([
+                '烤箱预热至200°C',
+                '将食材放入烤盘，刷上调料',
+                '烤15-25分钟至表面金黄'
+            ])
+        elif any(method in name_lower for method in ['煎', 'pan']):
+            instructions.extend([
+                '平底锅刷少许油，中火加热',
+                '放入食材煎制3-4分钟至一面金黄',
+                '翻面继续煎2-3分钟至熟透'
+            ])
+        else:
+            # Default cooking method
+            instructions.extend([
+                '热锅下油，放入食材翻炒',
+                '加入调料，炒制至熟透',
+                '根据口味调整调料用量'
+            ])
+        
+        # Final step
+        instructions.append('装盘即可享用这道美味的' + recipe_name)
+        
+        return instructions
+    
+    def _generate_smart_description(self, recipe_name: str, cuisine: str) -> str:
+        """Generate a smart description based on recipe name and cuisine."""
+        base_descriptions = {
+            '中式': '香味浓郁的传统中式料理',
+            '西式': '经典西式风味美食',
+            '日式': '清淡健康的日式料理',
+            '韩式': '鲜美可口的韩式美食',
+            '意式': '地道的意大利风味',
+            '泰式': '酸甜辣俱全的泰式风味'
+        }
+        
+        base_desc = base_descriptions.get(cuisine, '美味可口的料理')
+        return f'{base_desc}，{recipe_name}制作简单，营养丰富，适合家庭制作'
+    
+    def _estimate_cooking_times(self, recipe_name: str, meal_type: str) -> Dict[str, int]:
+        """Estimate cooking times based on recipe name and meal type."""
+        name_lower = recipe_name.lower()
+        
+        # Base times by meal type
+        base_times = {
+            'breakfast': {'prep_time': 10, 'cook_time': 15},
+            'lunch': {'prep_time': 15, 'cook_time': 25},
+            'dinner': {'prep_time': 20, 'cook_time': 30}
+        }
+        
+        times = base_times.get(meal_type, {'prep_time': 15, 'cook_time': 25})
+        
+        # Adjust based on cooking method
+        if any(method in name_lower for method in ['炒', 'stir']):
+            times['cook_time'] = min(times['cook_time'], 15)  # Quick stir-fry
+        elif any(method in name_lower for method in ['炖', 'stew', '煲']):
+            times['cook_time'] = max(times['cook_time'], 45)  # Slow cooking
+        elif any(method in name_lower for method in ['烤', 'bake']):
+            times['cook_time'] = max(times['cook_time'], 30)  # Baking takes time
+        elif any(method in name_lower for method in ['蒸', 'steam']):
+            times['cook_time'] = max(times['cook_time'], 20)  # Steaming
+        
+        return times
+    
+    def _estimate_difficulty(self, recipe_name: str) -> str:
+        """Estimate difficulty level based on recipe name."""
+        name_lower = recipe_name.lower()
+        
+        # Complex cooking methods
+        if any(method in name_lower for method in ['红烧', '糖醋', '宫保', '麻婆']):
+            return '困难'
+        elif any(method in name_lower for method in ['炖', 'stew', '煲']):
+            return '中等'
+        elif any(method in name_lower for method in ['炒', '煎', '蒸']):
+            return '简单'
+        else:
+            return '中等'
+    
+    def _generate_smart_tags(self, recipe_name: str, meal_type: str, cuisine: str) -> List[str]:
+        """Generate smart tags based on recipe analysis."""
+        tags = [meal_type, cuisine]
+        name_lower = recipe_name.lower()
+        
+        # Add cooking method tags
+        if any(method in name_lower for method in ['炒', 'stir']):
+            tags.append('快手菜')
+        elif any(method in name_lower for method in ['蒸', 'steam']):
+            tags.append('健康')
+        elif any(method in name_lower for method in ['汤', 'soup']):
+            tags.append('暖胃')
+        
+        # Add nutrition tags
+        if any(protein in name_lower for protein in ['鸡', '鱼', '虾']):
+            tags.append('高蛋白')
+        if any(veg in name_lower for veg in ['蔬菜', '青菜', '菠菜', '芦笋']):
+            tags.append('营养丰富')
+        
+        # Add difficulty tags
+        difficulty = self._estimate_difficulty(recipe_name)
+        if difficulty == '简单':
+            tags.append('新手友好')
+        
+        return list(set(tags))  # Remove duplicates
+    
+    def _create_fallback_recipe(self, basic_recipe: Dict[str, Any], meal_type: str) -> Dict[str, Any]:
+        """Create a fallback recipe when detailed generation fails (legacy method)."""
+        # Use the new smart fallback method
+        return self._create_smart_fallback_recipe(basic_recipe, meal_type)
+    
+    def _get_basic_ingredients_by_meal_type(self, meal_type: str) -> List[Dict[str, str]]:
+        """Get basic ingredients based on meal type."""
+        base_ingredients = [
+            {'name': '食用油', 'amount': '1汤匙'},
+            {'name': '盐', 'amount': '适量'},
+            {'name': '生抽', 'amount': '1汤匙'}
+        ]
+        
+        if meal_type == 'breakfast':
+            base_ingredients.extend([
+                {'name': '鸡蛋', 'amount': '2个'},
+                {'name': '面包', 'amount': '2片'},
+                {'name': '牛奶', 'amount': '200毫升'}
+            ])
+        elif meal_type == 'lunch':
+            base_ingredients.extend([
+                {'name': '米饭', 'amount': '150克'},
+                {'name': '蔬菜', 'amount': '200克'},
+                {'name': '蛋白质食材', 'amount': '100克'}
+            ])
+        elif meal_type == 'dinner':
+            base_ingredients.extend([
+                {'name': '主食', 'amount': '150克'},
+                {'name': '蔬菜', 'amount': '250克'},
+                {'name': '肉类', 'amount': '120克'}
+            ])
+        
+        return base_ingredients
+    
+    def _get_basic_instructions_by_meal_type(self, meal_type: str) -> List[str]:
+        """Get basic instructions based on meal type."""
+        if meal_type == 'breakfast':
+            return [
+                '准备所有食材，清洗干净',
+                '热锅下油，打散鸡蛋炒制',
+                '烤面包片至金黄色',
+                '搭配牛奶一起享用'
+            ]
+        elif meal_type == 'lunch':
+            return [
+                '准备所有食材，清洗切好',
+                '热锅下油，爆炒蔬菜',
+                '加入蛋白质食材继续炒制',
+                '调味后搭配米饭食用'
+            ]
+        elif meal_type == 'dinner':
+            return [
+                '准备所有食材，分别处理',
+                '热锅下油，先炒肉类',
+                '加入蔬菜炒制至断生',
+                '调味装盘，搭配主食享用'
+            ]
+        
+        return ['根据食材特点进行烹饪', '调味后即可享用']
+    
+    def _fix_json_syntax(self, json_content: str) -> str:
+        """Try to fix common JSON syntax errors."""
+        import re
+        
+        # Remove trailing commas before closing brackets/braces
+        json_content = re.sub(r',(\s*[}\]])', r'\1', json_content)
+        
+        # Fix missing commas between objects (basic attempt)
+        json_content = re.sub(r'}\s*{', r'},{', json_content)
+        
+        # Fix missing commas between array elements
+        json_content = re.sub(r']\s*\[', r'],[', json_content)
+        
+        # Remove any control characters that might cause issues
+        json_content = ''.join(char for char in json_content if ord(char) >= 32 or char in '\n\r\t')
+        
+        return json_content
 
     def _parse_recipe_details_response(self, response_text: str) -> Dict[str, Any]:
         """Parse the recipe details response from Gemini."""

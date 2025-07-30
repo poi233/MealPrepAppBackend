@@ -4,6 +4,8 @@ AI Integration serializers for MealPrepAI Django backend.
 from rest_framework import serializers
 from datetime import date, datetime
 from typing import Dict, Any
+from django.utils import timezone
+from django.conf import settings
 
 
 class GenerateMealPlanSerializer(serializers.Serializer):
@@ -76,12 +78,19 @@ class GenerateMealPlanSerializer(serializers.Serializer):
 
 class GeneratedMealPlanSerializer(serializers.Serializer):
     """Serializer for generated meal plan response."""
+    id = serializers.CharField(default="ai-generated")  # Add ID field for iOS compatibility
+    user_id = serializers.CharField(required=False)  # Add user_id field
     name = serializers.CharField()
     description = serializers.CharField()
     week_start_date = serializers.DateField()
+    is_active = serializers.BooleanField(default=False)  # Add is_active field
     plan_description = serializers.CharField()
     analysis_text = serializers.CharField()
+    items = serializers.JSONField(required=False)  # Add items field for compatibility
+    items_count = serializers.IntegerField(default=0)  # Add items_count field
     daily_meals = serializers.JSONField()
+    created_at = serializers.DateTimeField(default=serializers.CreateOnlyDefault(timezone.now))  # Add created_at
+    updated_at = serializers.DateTimeField(default=serializers.CreateOnlyDefault(timezone.now))  # Add updated_at
 
 
 class GenerateRecipeSerializer(serializers.Serializer):
@@ -167,7 +176,11 @@ class IngredientSerializer(serializers.Serializer):
 
 
 class GeneratedRecipeSerializer(serializers.Serializer):
-    """Serializer for generated recipe response."""
+    """Serializer for generated recipe response with deterministic UUID support."""
+    id = serializers.CharField(
+        required=False,
+        help_text="Deterministic UUID based on recipe content"
+    )
     name = serializers.CharField()
     description = serializers.CharField()
     cuisine = serializers.CharField()
@@ -185,6 +198,17 @@ class GeneratedRecipeSerializer(serializers.Serializer):
     )
     nutrition_info = serializers.JSONField()
     tags = serializers.ListField(child=serializers.CharField())
+    
+    def to_representation(self, instance):
+        """Add deterministic UUID if not present."""
+        data = super().to_representation(instance)
+        
+        # Generate deterministic UUID if not already present
+        if not data.get('id'):
+            from .services import generate_deterministic_recipe_uuid
+            data['id'] = generate_deterministic_recipe_uuid(data)
+            
+        return data
 
 
 class AnalyzeMealPlanSerializer(serializers.Serializer):
@@ -234,7 +258,7 @@ class MealPlanAnalysisSerializer(serializers.Serializer):
 
 
 class CreateRecipeFromAISerializer(serializers.Serializer):
-    """Serializer for creating a recipe from AI-generated data."""
+    """Serializer for creating a recipe from AI-generated data with enhanced UUID support."""
     ai_recipe_data = GeneratedRecipeSerializer()
     save_to_account = serializers.BooleanField(
         default=True,
@@ -255,6 +279,10 @@ class CreateRecipeFromAISerializer(serializers.Serializer):
         required=False,
         help_text="Meal type for meal plan assignment"
     )
+    recipe_id = serializers.UUIDField(
+        required=False,
+        help_text="Optional: Pre-computed deterministic UUID for the recipe"
+    )
 
     def validate(self, attrs):
         """Cross-field validation."""
@@ -269,6 +297,54 @@ class CreateRecipeFromAISerializer(serializers.Serializer):
                 })
         
         return attrs
+
+
+class StandardAPIResponseSerializer(serializers.Serializer):
+    """Standard API response format for consistency."""
+    success = serializers.BooleanField()
+    message = serializers.CharField(required=False)
+    data = serializers.JSONField(required=False)
+    errors = serializers.JSONField(required=False)
+    timestamp = serializers.DateTimeField()
+    
+
+class RecipeCreationResponseSerializer(serializers.Serializer):
+    """Response serializer for single recipe creation."""
+    success = serializers.BooleanField()
+    recipe = serializers.JSONField(
+        required=False,
+        help_text="Recipe data if creation was successful"
+    )
+    status = serializers.ChoiceField(
+        choices=['created', 'already_exists', 'updated', 'failed'],
+        help_text="Status of the recipe creation operation"
+    )
+    message = serializers.CharField(
+        help_text="User-friendly status description"
+    )
+    recipe_id = serializers.UUIDField(
+        required=False,
+        help_text="UUID of the created/existing recipe"
+    )
+    timestamp = serializers.DateTimeField()
+    
+
+class BatchRecipeItemResultSerializer(serializers.Serializer):
+    """Individual recipe result in batch operations."""
+    recipe_id = serializers.UUIDField(help_text="Recipe UUID")
+    name = serializers.CharField(help_text="Recipe name")
+    status = serializers.ChoiceField(
+        choices=['created', 'already_exists', 'failed'],
+        help_text="Processing status for this recipe"
+    )
+    error = serializers.CharField(
+        required=False,
+        help_text="Error message if processing failed"
+    )
+    meal_plan_added = serializers.BooleanField(
+        default=False,
+        help_text="Whether recipe was successfully added to meal plan"
+    )
 
     def validate_add_to_meal_plan(self, value):
         """Validate meal plan exists and belongs to user."""
@@ -331,3 +407,108 @@ class RecipeModificationSuggestionsSerializer(serializers.Serializer):
     )
     modified_instructions = serializers.CharField(required=False)
     modified_nutrition = serializers.JSONField(required=False)
+
+
+class BatchCreateRecipeItemSerializer(serializers.Serializer):
+    """Serializer for individual recipe item in batch creation."""
+    ai_recipe_data = GeneratedRecipeSerializer()
+    meal_plan_day = serializers.IntegerField(
+        required=False,
+        min_value=0,
+        max_value=6,
+        help_text="Day of week to add to meal plan (0=Monday, 6=Sunday)"
+    )
+    meal_plan_type = serializers.ChoiceField(
+        choices=['breakfast', 'lunch', 'dinner', 'snack'],
+        required=False,
+        help_text="Meal type for meal plan assignment"
+    )
+
+
+class BatchCreateRecipesFromAISerializer(serializers.Serializer):
+    """Enhanced serializer for batch recipe creation with improved response format."""
+    recipes = serializers.ListField(
+        child=BatchCreateRecipeItemSerializer(),
+        min_length=1,
+        max_length=20,
+        help_text="List of recipes to create (max 20 per batch)"
+    )
+    meal_plan_id = serializers.UUIDField(
+        required=False,
+        help_text="Optional meal plan ID to add all recipes to"
+    )
+    save_to_account = serializers.BooleanField(
+        default=True,
+        help_text="Whether to save all recipes to user's account"
+    )
+    skip_duplicates = serializers.BooleanField(
+        default=True,
+        help_text="Whether to skip recipes that already exist"
+    )
+
+    def validate_meal_plan_id(self, value):
+        """Validate meal plan exists and belongs to user."""
+        if value:
+            from apps.meal_plans.models import MealPlan
+            
+            request = self.context.get('request')
+            if not request or not hasattr(request, 'user'):
+                raise serializers.ValidationError("Authentication required")
+            
+            try:
+                meal_plan = MealPlan.objects.get(id=value, user=request.user)
+            except MealPlan.DoesNotExist:
+                raise serializers.ValidationError("Meal plan not found or not accessible")
+        
+        return value
+
+    def validate(self, attrs):
+        """Enhanced cross-field validation for batch creation."""
+        meal_plan_id = attrs.get('meal_plan_id')
+        recipes = attrs.get('recipes', [])
+        
+        # If meal plan is specified, validate that recipes with meal plan assignment have required fields
+        if meal_plan_id:
+            for i, recipe_item in enumerate(recipes):
+                if 'meal_plan_day' in recipe_item or 'meal_plan_type' in recipe_item:
+                    if recipe_item.get('meal_plan_day') is None or recipe_item.get('meal_plan_type') is None:
+                        raise serializers.ValidationError({
+                            'recipes': f'Recipe {i}: meal_plan_day and meal_plan_type are required when meal_plan_id is specified'
+                        })
+        
+        # Validate batch size for performance
+        if len(recipes) > 20:
+            raise serializers.ValidationError({
+                'recipes': 'Maximum 20 recipes allowed per batch operation'
+            })
+            
+        # Validate recipe data structure
+        for i, recipe_item in enumerate(recipes):
+            ai_recipe_data = recipe_item.get('ai_recipe_data', {})
+            if not ai_recipe_data.get('name'):
+                raise serializers.ValidationError({
+                    'recipes': f'Recipe {i}: name is required'
+                })
+        
+        return attrs
+
+
+class BatchCreateRecipesResponseSerializer(serializers.Serializer):
+    """Enhanced serializer for batch recipe creation response."""
+    success = serializers.BooleanField()
+    total_processed = serializers.IntegerField()
+    successful = serializers.IntegerField()
+    failed = serializers.IntegerField()
+    already_exists = serializers.IntegerField(default=0)
+    summary = serializers.JSONField(
+        help_text="Summary statistics and processing information"
+    )
+    results = serializers.ListField(
+        child=serializers.JSONField(),
+        help_text="Detailed results for each recipe processed"
+    )
+    timestamp = serializers.DateTimeField()
+    processing_time = serializers.FloatField(
+        required=False,
+        help_text="Processing time in seconds"
+    )

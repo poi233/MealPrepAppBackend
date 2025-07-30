@@ -50,6 +50,24 @@ class Recipe(models.Model):
         verbose_name = 'Recipe'
         verbose_name_plural = 'Recipes'
         ordering = ['-created_at']
+        
+        # Database indexes for performance optimization
+        indexes = [
+            # Performance indexes for common query patterns
+            models.Index(fields=['created_by_user', '-created_at'], name='recipe_user_created_idx'),
+            models.Index(fields=['cuisine', '-created_at'], name='recipe_cuisine_created_idx'),
+            models.Index(fields=['difficulty', '-avg_rating'], name='recipe_difficulty_rating_idx'),
+            models.Index(fields=['-avg_rating', 'rating_count'], name='recipe_rating_popularity_idx'),
+            models.Index(fields=['prep_time', 'cook_time'], name='recipe_time_idx'),
+            models.Index(fields=['-created_at', 'avg_rating'], name='recipe_recent_rated_idx'),
+            
+            # Search optimization indexes
+            models.Index(fields=['name'], name='recipe_name_search_idx'),
+            
+            # Compound indexes for common filter combinations
+            models.Index(fields=['created_by_user', 'cuisine'], name='recipe_user_cuisine_idx'),
+            models.Index(fields=['difficulty', 'cuisine'], name='recipe_difficulty_cuisine_idx'),
+        ]
 
     def __str__(self):
         return self.name

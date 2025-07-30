@@ -116,6 +116,8 @@ The API will be available at `http://localhost:8000/`
 
 **✅ iOS Compatibility (v2.0.3):** iOS app now fully supports the v2.0 structured ingredient format with automatic parsing and backward compatibility.
 
+**📱 Enhanced iOS Parsing (v2.0.4):** iOS client implements robust instruction parsing that handles multiple backend formats including stringified arrays, regular arrays, and traditional string formats for maximum compatibility.
+
 ## Development
 
 ### Project Structure
