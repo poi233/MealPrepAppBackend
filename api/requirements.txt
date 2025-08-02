@@ -1,2 +1,2 @@
-# Reference to main requirements
--r ../requirements.txt
+# Minimal production requirements for Vercel deployment
+-r ../requirements-minimal.txt
