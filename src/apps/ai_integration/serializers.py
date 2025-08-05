@@ -76,6 +76,87 @@ class GenerateMealPlanSerializer(serializers.Serializer):
         return value
 
 
+# MARK: - Recipe Stub Serializers (defined first for dependencies)
+
+class RecipeStubSerializer(serializers.Serializer):
+    """Lightweight recipe representation for meal plan generation phase."""
+    id = serializers.CharField(
+        required=False,
+        allow_null=True,
+        help_text="Database recipe_id if already exists, null if AI-generated only"
+    )
+    name = serializers.CharField(
+        max_length=255,
+        help_text="Recipe name (required)"
+    )
+    cuisine = serializers.CharField(
+        max_length=100,
+        required=False,
+        allow_null=True,
+        help_text="Cuisine type (e.g., '中式', '意式', '美式')"
+    )
+    description = serializers.CharField(
+        max_length=500,
+        required=False,
+        allow_null=True,
+        help_text="Short description for preview"
+    )
+    estimated_calories = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=0,
+        max_value=5000,
+        help_text="Estimated calories per serving"
+    )
+    estimated_prep_time = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=0,
+        max_value=480,
+        help_text="Estimated prep time in minutes"
+    )
+    image_url = serializers.CharField(
+        required=False,
+        allow_null=True,
+        help_text="Thumbnail image URL"
+    )
+    tags = serializers.ListField(
+        child=serializers.CharField(max_length=50),
+        required=False,
+        allow_null=True,
+        help_text="Recipe tags for filtering and display"
+    )
+
+    def validate_name(self, value):
+        """Validate recipe name."""
+        if not value or not value.strip():
+            raise serializers.ValidationError("Recipe name is required")
+        return value.strip()
+
+
+class LightweightDailyMealSerializer(serializers.Serializer):
+    """Daily meal structure using RecipeStub for lightweight meal plan generation."""
+    day = serializers.CharField(
+        max_length=20,
+        help_text="Day name (e.g., 'Monday', '星期一')"
+    )
+    breakfast = serializers.ListField(
+        child=RecipeStubSerializer(),
+        default=list,
+        help_text="Breakfast recipe stubs"
+    )
+    lunch = serializers.ListField(
+        child=RecipeStubSerializer(),
+        default=list,
+        help_text="Lunch recipe stubs"
+    )
+    dinner = serializers.ListField(
+        child=RecipeStubSerializer(),
+        default=list,
+        help_text="Dinner recipe stubs"
+    )
+
+
 class GeneratedMealPlanSerializer(serializers.Serializer):
     """Serializer for generated meal plan response."""
     id = serializers.CharField(default="ai-generated")  # Add ID field for iOS compatibility
@@ -88,7 +169,12 @@ class GeneratedMealPlanSerializer(serializers.Serializer):
     analysis_text = serializers.CharField()
     items = serializers.JSONField(required=False)  # Add items field for compatibility
     items_count = serializers.IntegerField(default=0)  # Add items_count field
-    daily_meals = serializers.JSONField()
+    daily_meals = serializers.JSONField(required=False)  # Full recipes for applied meal plans
+    lightweight_daily_meals = serializers.ListField(
+        child=LightweightDailyMealSerializer(),
+        required=False,
+        help_text="Recipe stubs for AI-generated suggestions"
+    )
     created_at = serializers.DateTimeField(default=serializers.CreateOnlyDefault(timezone.now))  # Add created_at
     updated_at = serializers.DateTimeField(default=serializers.CreateOnlyDefault(timezone.now))  # Add updated_at
 
@@ -187,7 +273,7 @@ class GeneratedRecipeSerializer(serializers.Serializer):
     difficulty = serializers.CharField()
     prep_time = serializers.IntegerField()
     cook_time = serializers.IntegerField()
-    image_url = serializers.CharField()
+    image_url = serializers.CharField(allow_blank=True, required=False)
     ingredients = serializers.ListField(
         child=IngredientSerializer(),
         help_text="List of ingredients with name and amount for one serving"
@@ -297,6 +383,71 @@ class CreateRecipeFromAISerializer(serializers.Serializer):
                 })
         
         return attrs
+
+
+class ApplyMealRequestSerializer(serializers.Serializer):
+    """Request serializer for applying a recipe stub to user's actual meal plan."""
+    recipe_stub = RecipeStubSerializer(
+        help_text="The stub to convert to full recipe"
+    )
+    meal_plan_id = serializers.UUIDField(
+        required=False,
+        allow_null=True,
+        help_text="Target meal plan ID (optional)"
+    )
+    day_of_week = serializers.IntegerField(
+        min_value=0,
+        max_value=6,
+        help_text="Day of week (0=Monday, 6=Sunday)"
+    )
+    meal_type = serializers.ChoiceField(
+        choices=['breakfast', 'lunch', 'dinner', 'snack'],
+        help_text="Meal type"
+    )
+    serving_size = serializers.FloatField(
+        required=False,
+        default=1.0,
+        min_value=0.1,
+        max_value=10.0,
+        help_text="Optional serving size adjustment"
+    )
+    save_to_account = serializers.BooleanField(
+        default=True,
+        help_text="Whether to save recipe to user's account"
+    )
+
+    def validate_meal_plan_id(self, value):
+        """Validate meal plan exists and belongs to user."""
+        if value:
+            from apps.meal_plans.models import MealPlan
+            
+            request = self.context.get('request')
+            if not request or not hasattr(request, 'user'):
+                raise serializers.ValidationError("Authentication required")
+            
+            try:
+                meal_plan = MealPlan.objects.get(id=value, user=request.user)
+            except MealPlan.DoesNotExist:
+                raise serializers.ValidationError("Meal plan not found or not accessible")
+        
+        return value
+
+
+class ApplyMealResponseSerializer(serializers.Serializer):
+    """Response serializer for apply meal operation."""
+    success = serializers.BooleanField()
+    recipe = serializers.JSONField(
+        required=False,
+        help_text="Complete recipe that was created"
+    )
+    meal_plan_item = serializers.JSONField(
+        required=False,
+        help_text="Created meal plan item (if added to plan)"
+    )
+    message = serializers.CharField(
+        required=False,
+        help_text="Success/error message"
+    )
 
 
 class StandardAPIResponseSerializer(serializers.Serializer):

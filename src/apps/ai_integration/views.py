@@ -13,11 +13,11 @@ from rest_framework.response import Response
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 
-from src.common.permissions import IsAuthenticatedAndActive
+from common.permissions import IsAuthenticatedAndActive
 from apps.recipes.models import Recipe
 from apps.recipes.serializers import RecipeSerializer
 from apps.meal_plans.models import MealPlan, MealPlanItem
-from .services import ai_service, MealPlanRequest, RecipeGenerationRequest, generate_deterministic_recipe_uuid
+from .services import ai_service, AIService, MealPlanRequest, RecipeGenerationRequest, generate_deterministic_recipe_uuid
 from .serializers import (
     GenerateMealPlanSerializer,
     GeneratedMealPlanSerializer,
@@ -252,15 +252,133 @@ class CreateRecipeFromAIView(generics.CreateAPIView):
         if not isinstance(nutrition_info, dict):
             return False, "Nutrition info must be a dictionary"
         
+        # DEBUG: Log the nutrition data being validated
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"🔬 DEBUG: Validating nutrition data: {nutrition_info}")
+        
         # Use the enhanced NutritionInfoSerializer for validation
         nutrition_serializer = NutritionInfoSerializer(data=nutrition_info)
         if not nutrition_serializer.is_valid():
+            # DEBUG: Log detailed error information
+            logger.error(f"🚨 DEBUG: Nutrition validation failed with errors: {nutrition_serializer.errors}")
+            logger.error(f"🔍 DEBUG: Input data was: {nutrition_info}")
+            
             errors = []
             for field, field_errors in nutrition_serializer.errors.items():
                 errors.append(f"{field}: {', '.join(field_errors)}")
             return False, f"Nutrition info validation failed: {'; '.join(errors)}"
         
+        logger.info(f"✅ DEBUG: Nutrition validation passed: {nutrition_serializer.validated_data}")
         return True, "Nutrition info validation passed"
+    
+    def _clean_nutrition_values(self, nutrition_info: dict) -> dict:
+        """
+        Clean AI-generated nutrition values by converting strings with units to pure numbers.
+        
+        Args:
+            nutrition_info: Nutrition info dictionary that may contain values with units
+            
+        Returns:
+            Cleaned nutrition info dictionary with numeric values
+        """
+        if not nutrition_info or not isinstance(nutrition_info, dict):
+            return nutrition_info
+        
+        import re
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        cleaned = {}
+        
+        for key, value in nutrition_info.items():
+            if value is None:
+                cleaned[key] = None
+                continue
+                
+            # If it's already a number, keep it
+            if isinstance(value, (int, float)):
+                cleaned[key] = float(value)
+                continue
+            
+            # If it's a string, try to extract the number
+            if isinstance(value, str):
+                # Remove common units and extract the number
+                # Examples: "25g" -> 25, "800mg" -> 800, "12.5g" -> 12.5
+                number_match = re.search(r'(\d+\.?\d*)', str(value))
+                if number_match:
+                    try:
+                        cleaned_value = float(number_match.group(1))
+                        cleaned[key] = cleaned_value
+                        logger.info(f"🧹 Cleaned nutrition value: {key} '{value}' -> {cleaned_value}")
+                    except ValueError:
+                        logger.warning(f"⚠️ Could not convert nutrition value: {key}='{value}', keeping as 0")
+                        cleaned[key] = 0.0
+                else:
+                    logger.warning(f"⚠️ No number found in nutrition value: {key}='{value}', keeping as 0")
+                    cleaned[key] = 0.0
+            else:
+                # For any other type, try to convert to float
+                try:
+                    cleaned[key] = float(value)
+                except (ValueError, TypeError):
+                    logger.warning(f"⚠️ Could not convert nutrition value: {key}={value}, keeping as 0")
+                    cleaned[key] = 0.0
+        
+        logger.info(f"🧹 Nutrition cleanup completed: {nutrition_info} -> {cleaned}")
+        return cleaned
+    
+    def _normalize_difficulty(self, difficulty: str) -> str:
+        """
+        Normalize AI-generated difficulty values to database-accepted English values.
+        
+        Args:
+            difficulty: Difficulty string that may be in Chinese or non-standard format
+            
+        Returns:
+            Normalized difficulty value ('easy', 'medium', or 'hard')
+        """
+        if not difficulty or not isinstance(difficulty, str):
+            return 'medium'  # Default fallback
+        
+        difficulty_lower = difficulty.lower().strip()
+        
+        # Chinese to English mapping
+        difficulty_mapping = {
+            # Chinese values
+            '简单': 'easy', '容易': 'easy', '初级': 'easy', '新手': 'easy',
+            '中等': 'medium', '普通': 'medium', '中级': 'medium', '适中': 'medium',
+            '困难': 'hard', '复杂': 'hard', '高级': 'hard', '专业': 'hard',
+            
+            # English variations
+            'easy': 'easy', 'simple': 'easy', 'basic': 'easy', 'beginner': 'easy',
+            'medium': 'medium', 'moderate': 'medium', 'intermediate': 'medium', 'normal': 'medium',
+            'hard': 'hard', 'difficult': 'hard', 'complex': 'hard', 'advanced': 'hard', 'expert': 'hard',
+            
+            # Number-based
+            '1': 'easy', '2': 'medium', '3': 'hard'
+        }
+        
+        # Try exact match first
+        if difficulty_lower in difficulty_mapping:
+            normalized = difficulty_mapping[difficulty_lower]
+            logger.info(f"🗺️ Normalized difficulty: '{difficulty}' -> '{normalized}'")
+            return normalized
+        
+        # Try partial matching for Chinese characters
+        if '简' in difficulty or '易' in difficulty:
+            logger.info(f"🗺️ Normalized difficulty (partial match): '{difficulty}' -> 'easy'")
+            return 'easy'
+        elif '难' in difficulty or '复' in difficulty:
+            logger.info(f"🗺️ Normalized difficulty (partial match): '{difficulty}' -> 'hard'")
+            return 'hard'
+        elif '中' in difficulty or '普' in difficulty:
+            logger.info(f"🗺️ Normalized difficulty (partial match): '{difficulty}' -> 'medium'")
+            return 'medium'
+        
+        # Default fallback
+        logger.warning(f"⚠️ Unknown difficulty value: '{difficulty}', defaulting to 'medium'")
+        return 'medium'
     
     def _validate_ingredients_structure(self, ingredients_data):
         """Validate ingredients structure with enhanced security checks."""
@@ -552,6 +670,158 @@ class CreateRecipeFromAIView(generics.CreateAPIView):
             logger.error(f"Error checking content similarity: {str(e)}", exc_info=True)
             return False, None
     
+    def _needs_ai_generation(self, ai_recipe_data: dict) -> bool:
+        """
+        Check if the recipe data needs AI generation for complete details.
+        
+        Args:
+            ai_recipe_data: Dictionary containing AI recipe data
+            
+        Returns:
+            Boolean indicating if AI generation is needed
+        """
+        try:
+            # Check if essential detailed information is missing or insufficient
+            ingredients = ai_recipe_data.get('ingredients', [])
+            instructions = ai_recipe_data.get('instructions', [])
+            
+            # Consider data incomplete if:
+            # 1. No ingredients or very few ingredients (< 2)
+            # 2. No instructions or very few instructions (< 2)  
+            # 3. Ingredients are just placeholder/generic data
+            # 4. Instructions are just placeholder/generic data
+            
+            needs_generation = False
+            
+            # Check ingredients
+            if not ingredients or len(ingredients) < 2:
+                needs_generation = True
+                logger.info("Recipe needs AI generation: insufficient ingredients")
+            elif isinstance(ingredients, list):
+                # Check for placeholder ingredients
+                placeholder_indicators = ['主要食材', '调料', 'ingredient', 'amount', '适量']
+                for ingredient in ingredients:
+                    if isinstance(ingredient, dict):
+                        ingredient_name = ingredient.get('name', '').lower()
+                        if any(placeholder in ingredient_name for placeholder in placeholder_indicators):
+                            needs_generation = True
+                            logger.info("Recipe needs AI generation: placeholder ingredients detected")
+                            break
+                    elif isinstance(ingredient, str) and any(placeholder in ingredient.lower() for placeholder in placeholder_indicators):
+                        needs_generation = True
+                        logger.info("Recipe needs AI generation: placeholder ingredients detected")
+                        break
+            
+            # Check instructions
+            if not instructions or len(instructions) < 2:
+                needs_generation = True
+                logger.info("Recipe needs AI generation: insufficient instructions")
+            elif isinstance(instructions, list):
+                # Check for placeholder instructions
+                placeholder_indicators = ['准备所需食材', '按照传统做法', '调味并完成', 'step', '做法']
+                for instruction in instructions:
+                    if isinstance(instruction, str) and any(placeholder in instruction.lower() for placeholder in placeholder_indicators):
+                        needs_generation = True
+                        logger.info("Recipe needs AI generation: placeholder instructions detected")
+                        break
+            
+            return needs_generation
+            
+        except Exception as e:
+            logger.error(f"Error checking if AI generation needed: {str(e)}")
+            return True  # Default to generating if there's an error
+    
+    def _generate_unique_recipe_image(self, recipe_name: str, cuisine: str = None, ingredients: list = None) -> str:
+        """
+        Generate a unique image URL for each recipe using enhanced search terms.
+        
+        Args:
+            recipe_name: Name of the recipe
+            cuisine: Cuisine type (optional)
+            ingredients: List of ingredients (optional)
+            
+        Returns:
+            Image URL string
+        """
+        try:
+            # Create more specific search query using recipe characteristics
+            search_terms = []
+            
+            # Add recipe name
+            if recipe_name:
+                search_terms.append(recipe_name.lower())
+            
+            # Add cuisine for context
+            if cuisine:
+                search_terms.append(cuisine.lower())
+            
+            # Add key ingredients for specificity
+            if ingredients and isinstance(ingredients, list):
+                # Extract key ingredients (up to 2 most important ones)
+                key_ingredients = []
+                for ingredient in ingredients[:2]:  # Only use first 2 ingredients
+                    if isinstance(ingredient, dict) and 'name' in ingredient:
+                        ingredient_name = ingredient['name'].lower()
+                        # Filter out generic terms
+                        if not any(generic in ingredient_name for generic in ['调料', '适量', 'seasoning', 'salt', 'pepper']):
+                            key_ingredients.append(ingredient_name)
+                    elif isinstance(ingredient, str):
+                        ingredient_name = ingredient.lower()
+                        if not any(generic in ingredient_name for generic in ['调料', '适量', 'seasoning', 'salt', 'pepper']):
+                            key_ingredients.append(ingredient_name)
+                
+                search_terms.extend(key_ingredients)
+            
+            # Create unique search query
+            unique_query = ' '.join(search_terms) + ' food dish'
+            
+            # Try to use Pexels API with unique search terms
+            try:
+                image_url = ai_service._fetch_pexels_image(
+                    recipe_name=recipe_name,
+                    cuisine=cuisine, 
+                    ai_query=unique_query
+                )
+                
+                # If we got a valid non-fallback image, return it
+                if image_url and not image_url.endswith('pexels-photo-1640777.jpeg'):
+                    return image_url
+            except Exception as e:
+                logger.warning(f"Pexels API failed for recipe '{recipe_name}': {str(e)}")
+            
+            # Generate unique fallback URLs based on recipe characteristics
+            # Use different placeholder images for different types of dishes
+            recipe_name_lower = recipe_name.lower() if recipe_name else ''
+            cuisine_lower = cuisine.lower() if cuisine else ''
+            
+            # Create hash-based unique image selection
+            import hashlib
+            unique_string = f"{recipe_name}_{cuisine}_{len(ingredients) if ingredients else 0}"
+            hash_value = int(hashlib.md5(unique_string.encode()).hexdigest()[:8], 16)
+            
+            # Select from different food image URLs based on hash
+            food_images = [
+                "https://images.pexels.com/photos/1640777/pexels-photo-1640777.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&fit=crop",
+                "https://images.pexels.com/photos/376464/pexels-photo-376464.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&fit=crop", 
+                "https://images.pexels.com/photos/70497/pexels-photo-70497.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&fit=crop",
+                "https://images.pexels.com/photos/461198/pexels-photo-461198.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&fit=crop",
+                "https://images.pexels.com/photos/1279330/pexels-photo-1279330.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&fit=crop",
+                "https://images.pexels.com/photos/699953/pexels-photo-699953.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&fit=crop",
+                "https://images.pexels.com/photos/1352199/pexels-photo-1352199.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&fit=crop",
+                "https://images.pexels.com/photos/1099680/pexels-photo-1099680.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&fit=crop"
+            ]
+            
+            # Select image based on hash for consistency but uniqueness
+            selected_image = food_images[hash_value % len(food_images)]
+            
+            logger.info(f"Generated unique fallback image for recipe '{recipe_name}': {selected_image}")
+            return selected_image
+            
+        except Exception as e:
+            logger.error(f"Error generating unique recipe image: {str(e)}")
+            # Final fallback - return the original fallback image
+            return "https://images.pexels.com/photos/1640777/pexels-photo-1640777.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&fit=crop"
+
     def _calculate_name_similarity(self, name1: str, name2: str) -> float:
         """Calculate simple name similarity score.
         
@@ -724,20 +994,92 @@ class CreateRecipeFromAIView(generics.CreateAPIView):
                     status=status.HTTP_200_OK
                 )
             
-            # Extract and validate recipe data
-            recipe_data = {
-                'name': ai_recipe_data.get('name'),
-                'description': ai_recipe_data.get('description'),
-                'cuisine': ai_recipe_data.get('cuisine'),
-                'difficulty': ai_recipe_data.get('difficulty'),
-                'prep_time': ai_recipe_data.get('prep_time'),
-                'cook_time': ai_recipe_data.get('cook_time'),
-                'ingredients': ai_recipe_data.get('ingredients'),
-                'instructions': ai_recipe_data.get('instructions'),
-                'nutrition_info': ai_recipe_data.get('nutrition_info', {}),
-                'image_url': ai_recipe_data.get('image_url', ''),
-                'tags': ai_recipe_data.get('tags', [])
-            }
+            # Check if we need to generate complete recipe details using AI
+            needs_ai_generation = self._needs_ai_generation(ai_recipe_data)
+            
+            if needs_ai_generation:
+                logger.info(f"Recipe data incomplete, generating detailed information using AI for: {ai_recipe_data.get('name', 'Unknown')}")
+                
+                # Create recipe generation request
+                recipe_request = RecipeGenerationRequest(
+                    name=ai_recipe_data.get('name', 'Unknown Recipe'),
+                    description=ai_recipe_data.get('description', ''),
+                    cuisine=ai_recipe_data.get('cuisine', ''),
+                    difficulty=ai_recipe_data.get('difficulty', 'medium'),
+                    prep_time=ai_recipe_data.get('prep_time'),
+                    cook_time=ai_recipe_data.get('cook_time'),
+                    meal_type='dinner',  # Default meal type
+                    dietary_restrictions=[],
+                    ingredients=ai_recipe_data.get('ingredients', []) if isinstance(ai_recipe_data.get('ingredients'), list) and ai_recipe_data.get('ingredients') else [],
+                    additional_requirements=f"Generate complete detailed recipe for {ai_recipe_data.get('name', 'this dish')} with authentic ingredients and step-by-step instructions."
+                )
+                
+                # Generate detailed recipe using AI service
+                import asyncio
+                result = asyncio.run(ai_service.generate_recipe_details(recipe_request, request.user))
+                
+                if result.get('success') and result.get('recipe'):
+                    # Use AI-generated detailed recipe data
+                    generated_recipe = result['recipe']
+                    logger.info(f"Successfully generated detailed recipe via AI: {generated_recipe.get('name')}")
+                    
+                    # Extract and enhance recipe data with AI-generated content
+                    recipe_data = {
+                        'name': generated_recipe.get('name', ai_recipe_data.get('name')),
+                        'description': generated_recipe.get('description', ai_recipe_data.get('description', '')),
+                        'cuisine': generated_recipe.get('cuisine', ai_recipe_data.get('cuisine', '')),
+                        'difficulty': self._normalize_difficulty(generated_recipe.get('difficulty', ai_recipe_data.get('difficulty', 'medium'))),
+                        'prep_time': generated_recipe.get('prep_time', ai_recipe_data.get('prep_time', 30)),
+                        'cook_time': generated_recipe.get('cook_time', ai_recipe_data.get('cook_time', 30)),
+                        'ingredients': generated_recipe.get('ingredients', ai_recipe_data.get('ingredients', [])),
+                        'instructions': generated_recipe.get('instructions', ai_recipe_data.get('instructions', [])),
+                        'nutrition_info': self._clean_nutrition_values(generated_recipe.get('nutrition_info', ai_recipe_data.get('nutrition_info', {}))),
+                        'image_url': generated_recipe.get('image_url', ''),
+                        'tags': generated_recipe.get('tags', ai_recipe_data.get('tags', []))
+                    }
+                else:
+                    logger.warning(f"AI recipe generation failed, using original data: {result.get('error', 'Unknown error')}")
+                    # Fall back to original data
+                    recipe_data = {
+                        'name': ai_recipe_data.get('name'),
+                        'description': ai_recipe_data.get('description', ''),
+                        'cuisine': ai_recipe_data.get('cuisine', ''),
+                        'difficulty': self._normalize_difficulty(ai_recipe_data.get('difficulty', 'medium')),
+                        'prep_time': ai_recipe_data.get('prep_time', 30),
+                        'cook_time': ai_recipe_data.get('cook_time', 30),
+                        'ingredients': ai_recipe_data.get('ingredients', []),
+                        'instructions': ai_recipe_data.get('instructions', []),
+                        'nutrition_info': self._clean_nutrition_values(ai_recipe_data.get('nutrition_info', {})),
+                        'image_url': '',
+                        'tags': ai_recipe_data.get('tags', [])
+                    }
+            else:
+                # Use the provided complete recipe data
+                recipe_data = {
+                    'name': ai_recipe_data.get('name'),
+                    'description': ai_recipe_data.get('description', ''),
+                    'cuisine': ai_recipe_data.get('cuisine', ''),
+                    'difficulty': ai_recipe_data.get('difficulty', 'medium'),
+                    'prep_time': ai_recipe_data.get('prep_time', 30),
+                    'cook_time': ai_recipe_data.get('cook_time', 30),
+                    'ingredients': ai_recipe_data.get('ingredients', []),
+                    'instructions': ai_recipe_data.get('instructions', []),
+                    'nutrition_info': ai_recipe_data.get('nutrition_info', {}),
+                    'image_url': ai_recipe_data.get('image_url', ''),
+                    'tags': ai_recipe_data.get('tags', [])
+                }
+            
+            # Handle image_url - auto generate from Pexels if empty or missing
+            image_url = recipe_data.get('image_url', '').strip()
+            if not image_url:
+                # Generate unique image for this specific recipe
+                image_url = self._generate_unique_recipe_image(
+                    recipe_name=recipe_data.get('name', ''),
+                    cuisine=recipe_data.get('cuisine', ''),
+                    ingredients=recipe_data.get('ingredients', [])
+                )
+                recipe_data['image_url'] = image_url
+                logger.info(f"Auto-generated unique image URL for recipe '{recipe_data.get('name')}': {image_url}")
             
             # Validate recipe data completeness
             is_valid, validation_error = self._validate_recipe_data(recipe_data)
@@ -918,7 +1260,8 @@ class CreateRecipeFromAIView(generics.CreateAPIView):
             )
             
         except Exception as e:
-            logger.error(f"Unexpected error in recipe creation for user {getattr(request, 'user', {}).get('id', 'unknown')}: {str(e)}", exc_info=True)
+            user_id = getattr(request.user, 'id', 'unknown') if hasattr(request, 'user') else 'unknown'
+            logger.error(f"Unexpected error in recipe creation for user {user_id}: {str(e)}", exc_info=True)
             return Response(
                 {
                     'success': False,
@@ -1226,7 +1569,7 @@ def batch_create_recipes_from_ai(request):
                         'cook_time': ai_recipe_data.get('cook_time'),
                         'ingredients': ai_recipe_data.get('ingredients'),
                         'instructions': ai_recipe_data.get('instructions'),
-                        'nutrition_info': ai_recipe_data.get('nutrition_info', {}),
+                        'nutrition_info': self._clean_nutrition_values(ai_recipe_data.get('nutrition_info', {})),
                         'image_url': ai_recipe_data.get('image_url', ''),
                         'tags': ai_recipe_data.get('tags', [])
                     }
@@ -1508,5 +1851,350 @@ def suggest_recipe_substitutions(request, recipe_id):
         logger.error(f"Error suggesting recipe substitutions: {str(e)}", exc_info=True)
         return Response(
             {'error': 'Failed to suggest recipe substitutions'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+class GenerateRecipeDetailsOnDemandView(generics.CreateAPIView):
+    """Generate detailed recipe information on-demand for fast meal plan generation."""
+    permission_classes = [IsAuthenticatedAndActive]
+    
+    @swagger_auto_schema(
+        operation_description="""
+        Generate detailed recipe information on-demand for recipes created during fast meal plan generation.
+        
+        This endpoint supports the two-phase meal plan generation approach:
+        1. Phase 1: Fast meal plan generation with basic recipe info (< 10s for Vercel)
+        2. Phase 2: On-demand detailed recipe generation when users need full recipe details
+        
+        Use Cases:
+        - User clicks on a basic recipe in their meal plan to see full details
+        - Batch enhancement of multiple basic recipes in a meal plan
+        - Progressive loading of recipe details in mobile apps
+        
+        Performance:
+        - Optimized for single recipe detail generation
+        - Supports batch requests for up to 10 recipes
+        - Implements smart caching to avoid duplicate AI calls
+        """,
+        operation_summary="Generate Recipe Details On-Demand",
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            properties={
+                'recipe_id': openapi.Schema(
+                    type=openapi.TYPE_STRING,
+                    format=openapi.FORMAT_UUID,
+                    description='ID of the basic recipe to enhance with details'
+                ),
+                'recipe_name': openapi.Schema(
+                    type=openapi.TYPE_STRING,
+                    description='Name of the recipe (for AI generation if recipe not found in DB)'
+                ),
+                'meal_type': openapi.Schema(
+                    type=openapi.TYPE_STRING,
+                    enum=['breakfast', 'lunch', 'dinner', 'snack'],
+                    description='Meal type for context-aware generation'
+                ),
+                'dietary_preferences': openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    description='User dietary preferences for customization'
+                ),
+                'detail_level': openapi.Schema(
+                    type=openapi.TYPE_STRING,
+                    enum=['basic', 'full'],
+                    default='full',
+                    description='Level of detail to generate'
+                )
+            },
+            required=['recipe_name']
+        ),
+        responses={
+            200: openapi.Response('Recipe details generated successfully', GeneratedRecipeSerializer),
+            400: openapi.Response('Validation failed'),
+            404: openapi.Response('Recipe not found'),
+            500: openapi.Response('Server error')
+        },
+        tags=['AI Integration - On-Demand Generation']
+    )
+    def post(self, request):
+        """Generate detailed recipe information on-demand."""
+        try:
+            # Validate request data
+            recipe_id = request.data.get('recipe_id')
+            recipe_name = request.data.get('recipe_name')
+            meal_type = request.data.get('meal_type', 'dinner')
+            dietary_preferences = request.data.get('dietary_preferences', {})
+            detail_level = request.data.get('detail_level', 'full')
+            
+            if not recipe_name:
+                return Response(
+                    {'error': 'Recipe name is required'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            logger.info(f"On-demand recipe generation request for user {request.user.id}: {recipe_name}")
+            
+            # Check if we have a basic recipe in the database first
+            existing_recipe = None
+            if recipe_id:
+                try:
+                    existing_recipe = Recipe.objects.get(id=recipe_id)
+                    logger.info(f"Found existing recipe {recipe_id}: {existing_recipe.name}")
+                    
+                    # If the existing recipe already has detailed information, return it
+                    if (existing_recipe.instructions and 
+                        len(existing_recipe.instructions) > 50 and 
+                        existing_recipe.ingredients and 
+                        len(existing_recipe.ingredients) > 0):
+                        
+                        logger.info(f"Recipe {recipe_id} already has detailed information, returning existing data")
+                        
+                        # Convert existing recipe to response format
+                        recipe_data = {
+                            'id': str(existing_recipe.id),
+                            'name': existing_recipe.name,
+                            'description': existing_recipe.description,
+                            'cuisine': existing_recipe.cuisine,
+                            'difficulty': existing_recipe.difficulty,
+                            'prep_time': existing_recipe.prep_time,
+                            'cook_time': existing_recipe.cook_time,
+                            'image_url': existing_recipe.image_url,
+                            'ingredients': existing_recipe.ingredients,
+                            'instructions': existing_recipe.instructions.split('\n') if existing_recipe.instructions else [],
+                            'nutrition_info': existing_recipe.nutrition_info or {},
+                            'tags': existing_recipe.tags or []
+                        }
+                        
+                        return Response(recipe_data, status=status.HTTP_200_OK)
+                        
+                except Recipe.DoesNotExist:
+                    logger.info(f"Recipe {recipe_id} not found in database, will generate from scratch")
+                    pass
+            
+            # Generate detailed recipe using AI service
+            recipe_request = RecipeGenerationRequest(
+                name=recipe_name,
+                description=f"Detailed recipe for {recipe_name}",
+                meal_type=meal_type,
+                dietary_restrictions=dietary_preferences.get('dietary_restrictions', []),
+                additional_requirements=f"Generate a complete, detailed recipe with full ingredient list and step-by-step instructions. Detail level: {detail_level}"
+            )
+            
+            # Generate recipe using AI service with asyncio
+            import asyncio
+            result = asyncio.run(ai_service.generate_recipe_details(recipe_request, request.user))
+            
+            if not result['success']:
+                logger.error(f"AI recipe generation failed: {result['error']}")
+                return Response(
+                    {'error': result['error']},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            
+            # Update existing recipe if we have one, otherwise return the generated data
+            generated_recipe = result['recipe']
+            
+            if existing_recipe and recipe_id:
+                try:
+                    # Update the existing basic recipe with detailed information
+                    existing_recipe.description = generated_recipe.get('description', existing_recipe.description)
+                    existing_recipe.ingredients = generated_recipe.get('ingredients', existing_recipe.ingredients)
+                    existing_recipe.instructions = '\n'.join(generated_recipe.get('instructions', [])) if generated_recipe.get('instructions') else existing_recipe.instructions
+                    existing_recipe.nutrition_info = self._clean_nutrition_values(generated_recipe.get('nutrition_info', existing_recipe.nutrition_info))
+                    existing_recipe.prep_time = generated_recipe.get('prep_time', existing_recipe.prep_time)
+                    existing_recipe.cook_time = generated_recipe.get('cook_time', existing_recipe.cook_time)
+                    existing_recipe.difficulty = self._normalize_difficulty(generated_recipe.get('difficulty', existing_recipe.difficulty))
+                    existing_recipe.cuisine = generated_recipe.get('cuisine', existing_recipe.cuisine)
+                    existing_recipe.tags = generated_recipe.get('tags', existing_recipe.tags)
+                    existing_recipe.save()
+                    
+                    logger.info(f"Updated existing recipe {recipe_id} with detailed information")
+                    
+                    # Return updated recipe data
+                    recipe_data = {
+                        'id': str(existing_recipe.id),
+                        'name': existing_recipe.name,
+                        'description': existing_recipe.description,
+                        'cuisine': existing_recipe.cuisine,
+                        'difficulty': existing_recipe.difficulty,
+                        'prep_time': existing_recipe.prep_time,
+                        'cook_time': existing_recipe.cook_time,
+                        'image_url': existing_recipe.image_url,
+                        'ingredients': existing_recipe.ingredients,
+                        'instructions': existing_recipe.instructions.split('\n') if existing_recipe.instructions else [],
+                        'nutrition_info': existing_recipe.nutrition_info or {},
+                        'tags': existing_recipe.tags or []
+                    }
+                    
+                    return Response(recipe_data, status=status.HTTP_200_OK)
+                    
+                except Exception as e:
+                    logger.error(f"Error updating existing recipe {recipe_id}: {str(e)}")
+                    # Fall through to return generated data without saving
+            
+            # Serialize and return the generated recipe data
+            recipe_serializer = GeneratedRecipeSerializer(generated_recipe)
+            
+            logger.info(f"On-demand recipe details generated for user {request.user.id}: {recipe_name}")
+            
+            return Response(
+                recipe_serializer.data,
+                status=status.HTTP_200_OK
+            )
+            
+        except Exception as e:
+            logger.error(f"Error generating recipe details on-demand: {str(e)}", exc_info=True)
+            return Response(
+                {'error': 'Failed to generate recipe details'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+@swagger_auto_schema(
+    method='post',
+    operation_description="""
+    Apply a RecipeStub to user's meal plan by converting it to a complete Recipe.
+    
+    This is the second phase of the lightweight meal plan system:
+    1. Takes a RecipeStub from the lightweight meal plan generation
+    2. Converts it to a complete Recipe with full details using AI
+    3. Optionally saves the recipe to user's account
+    4. Optionally adds the recipe to a specific meal plan
+    
+    Key Features:
+    - Converts lightweight RecipeStub to complete Recipe
+    - AI-powered recipe detail generation
+    - Optional meal plan integration
+    - Automatic recipe deduplication
+    - Serving size adjustment support
+    """,
+    operation_summary="Apply Recipe Stub to Meal Plan",
+    request_body=openapi.Schema(
+        type=openapi.TYPE_OBJECT,
+        required=['recipe_stub', 'day_of_week', 'meal_type'],
+        properties={
+            'recipe_stub': openapi.Schema(
+                type=openapi.TYPE_OBJECT,
+                description="RecipeStub object from lightweight meal plan",
+                properties={
+                    'id': openapi.Schema(type=openapi.TYPE_STRING, allow_null=True, description="Recipe ID if exists"),
+                    'name': openapi.Schema(type=openapi.TYPE_STRING, description="Recipe name"),
+                    'cuisine': openapi.Schema(type=openapi.TYPE_STRING, allow_null=True, description="Cuisine type"),
+                    'description': openapi.Schema(type=openapi.TYPE_STRING, allow_null=True, description="Short description"),
+                    'estimated_calories': openapi.Schema(type=openapi.TYPE_INTEGER, allow_null=True, description="Estimated calories"),
+                    'estimated_prep_time': openapi.Schema(type=openapi.TYPE_INTEGER, allow_null=True, description="Estimated prep time"),
+                    'image_url': openapi.Schema(type=openapi.TYPE_STRING, allow_null=True, description="Image URL"),
+                    'tags': openapi.Schema(type=openapi.TYPE_ARRAY, items=openapi.Schema(type=openapi.TYPE_STRING), description="Recipe tags")
+                }
+            ),
+            'meal_plan_id': openapi.Schema(type=openapi.TYPE_STRING, format=openapi.FORMAT_UUID, description="Target meal plan ID (optional)"),
+            'day_of_week': openapi.Schema(type=openapi.TYPE_INTEGER, minimum=0, maximum=6, description="Day of week (0=Monday, 6=Sunday)"),
+            'meal_type': openapi.Schema(type=openapi.TYPE_STRING, enum=['breakfast', 'lunch', 'dinner', 'snack'], description="Meal type"),
+            'serving_size': openapi.Schema(type=openapi.TYPE_NUMBER, format=openapi.FORMAT_FLOAT, default=1.0, description="Serving size multiplier"),
+            'save_to_account': openapi.Schema(type=openapi.TYPE_BOOLEAN, default=True, description="Save recipe to user account")
+        }
+    ),
+    responses={
+        200: openapi.Response(
+            'Recipe successfully applied',
+            openapi.Schema(
+                type=openapi.TYPE_OBJECT,
+                properties={
+                    'success': openapi.Schema(type=openapi.TYPE_BOOLEAN),
+                    'recipe': openapi.Schema(type=openapi.TYPE_OBJECT, description="Complete recipe data"),
+                    'meal_plan_item': openapi.Schema(type=openapi.TYPE_OBJECT, description="Created meal plan item (if added)"),
+                    'message': openapi.Schema(type=openapi.TYPE_STRING, description="Success message")
+                }
+            )
+        ),
+        400: openapi.Response('Invalid request data'),
+        401: openapi.Response('Authentication required'),
+        404: openapi.Response('Meal plan not found'),
+        500: openapi.Response('Server error during recipe application')
+    },
+    tags=['AI Integration - Apply Meal']
+)
+@api_view(['POST'])
+@permission_classes([IsAuthenticatedAndActive])
+def apply_meal_to_plan(request):
+    """
+    Apply a RecipeStub to user's meal plan by converting it to a complete Recipe.
+    
+    This endpoint handles the second phase of the lightweight meal plan system.
+    """
+    try:
+        # Import serializers here to avoid circular imports
+        from .serializers import ApplyMealRequestSerializer, ApplyMealResponseSerializer
+        
+        # Validate request data
+        serializer = ApplyMealRequestSerializer(data=request.data, context={'request': request})
+        
+        if not serializer.is_valid():
+            return Response(
+                {
+                    'success': False,
+                    'errors': serializer.errors
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        validated_data = serializer.validated_data
+        
+        # Extract parameters
+        recipe_stub = validated_data['recipe_stub']
+        meal_plan_id = validated_data.get('meal_plan_id')
+        day_of_week = validated_data['day_of_week']
+        meal_type = validated_data['meal_type']
+        serving_size = validated_data.get('serving_size', 1.0)
+        save_to_account = validated_data.get('save_to_account', True)
+        
+        # Log the operation
+        logger.info(f"Applying meal to plan for user {request.user.id}: {recipe_stub.get('name', 'Unknown')}")
+        
+        # Call the AI service to apply the meal
+        result = ai_service.apply_meal_to_plan(
+            recipe_stub=recipe_stub,
+            user=request.user,
+            meal_plan_id=str(meal_plan_id) if meal_plan_id else None,
+            day_of_week=day_of_week,
+            meal_type=meal_type,
+            serving_size=serving_size,
+            save_to_account=save_to_account
+        )
+        
+        # Since ai_service.apply_meal_to_plan is async, we need to await it
+        import asyncio
+        if asyncio.iscoroutine(result):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(result)
+            finally:
+                loop.close()
+        
+        if result.get('success'):
+            logger.info(f"Successfully applied meal for user {request.user.id}")
+            
+            # Serialize the response
+            response_serializer = ApplyMealResponseSerializer(result)
+            
+            return Response(
+                response_serializer.data,
+                status=status.HTTP_200_OK
+            )
+        else:
+            logger.error(f"Failed to apply meal for user {request.user.id}: {result.get('error', 'Unknown error')}")
+            return Response(
+                result,
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+            
+    except Exception as e:
+        logger.error(f"Error in apply_meal_to_plan view: {str(e)}", exc_info=True)
+        return Response(
+            {
+                'success': False,
+                'error': 'Failed to apply meal to plan'
+            },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )

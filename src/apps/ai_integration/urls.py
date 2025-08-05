@@ -34,6 +34,13 @@ urlpatterns = [
         name='generate_recipe_details'
     ),
     
+    # On-demand detailed recipe generation for meal plans
+    path(
+        'generate-recipe-details-on-demand/', 
+        views.GenerateRecipeDetailsOnDemandView.as_view(), 
+        name='generate_recipe_details_on_demand'
+    ),
+    
     # Scene A: Single recipe creation ("Save to Template")
     path(
         'create-recipe-from-ai/', 
@@ -46,6 +53,13 @@ urlpatterns = [
         'batch-create-recipes-from-ai/', 
         views.batch_create_recipes_from_ai, 
         name='batch_create_recipes_from_ai'
+    ),
+    
+    # Phase 2: Apply recipe stub to meal plan (lightweight to complete)
+    path(
+        'apply-meal-to-plan/', 
+        views.apply_meal_to_plan, 
+        name='apply_meal_to_plan'
     ),
     
     path(

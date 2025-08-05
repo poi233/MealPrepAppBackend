@@ -47,32 +47,51 @@ class IngredientSerializer(serializers.Serializer):
         return text.strip()[:max_length]
 
 
+class FlexibleNutritionField(serializers.Field):
+    """Custom field that accepts both integers and decimals for nutrition values."""
+    
+    def __init__(self, min_value=0, max_value=None, **kwargs):
+        self.min_value = min_value
+        self.max_value = max_value
+        super().__init__(**kwargs)
+    
+    def to_internal_value(self, data):
+        if data is None:
+            return None
+        
+        try:
+            # Convert to float, handling both int and decimal inputs
+            value = float(data)
+            
+            # Validate range
+            if value < self.min_value:
+                raise serializers.ValidationError(f'Value must be at least {self.min_value}')
+            
+            if self.max_value is not None and value > self.max_value:
+                raise serializers.ValidationError(f'Value must be at most {self.max_value}')
+            
+            # Round to 2 decimal places
+            return round(value, 2)
+            
+        except (ValueError, TypeError):
+            raise serializers.ValidationError('A valid number is required.')
+    
+    def to_representation(self, value):
+        if value is None:
+            return None
+        return float(value)
+
+
 class NutritionInfoSerializer(serializers.Serializer):
     """Serializer for nutrition information with enhanced validation."""
-    calories = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=5000
-    )
-    protein = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=500
-    )
-    carbs = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=1000
-    )
-    carbohydrates = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=1000
-    )
-    fat = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=300
-    )
-    fiber = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=100
-    )
-    sugar = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=200
-    )
-    sodium = serializers.DecimalField(
-        max_digits=8, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=10000
-    )
+    calories = FlexibleNutritionField(min_value=0, max_value=5000, required=False, allow_null=True)
+    protein = FlexibleNutritionField(min_value=0, max_value=500, required=False, allow_null=True)
+    carbs = FlexibleNutritionField(min_value=0, max_value=1000, required=False, allow_null=True)
+    carbohydrates = FlexibleNutritionField(min_value=0, max_value=1000, required=False, allow_null=True)
+    fat = FlexibleNutritionField(min_value=0, max_value=300, required=False, allow_null=True)
+    fiber = FlexibleNutritionField(min_value=0, max_value=100, required=False, allow_null=True)
+    sugar = FlexibleNutritionField(min_value=0, max_value=200, required=False, allow_null=True)
+    sodium = FlexibleNutritionField(min_value=0, max_value=10000, required=False, allow_null=True)
     servings = serializers.IntegerField(
         required=False, allow_null=True, min_value=1, max_value=50
     )
@@ -92,42 +111,7 @@ class NutritionInfoSerializer(serializers.Serializer):
                 f"Unknown nutrition fields: {', '.join(unknown_fields)}"
             )
         
-        # Round all numeric values to 2 decimal places and validate ranges
-        for field, value in attrs.items():
-            if value is not None:
-                if field == 'servings':
-                    # Servings should be an integer
-                    attrs[field] = int(value)
-                else:
-                    # Other fields are decimals
-                    rounded_value = round(float(value), 2)
-                    
-                    # Additional range validation
-                    if rounded_value < 0:
-                        raise serializers.ValidationError(
-                            f"{field} cannot be negative"
-                        )
-                    
-                    # Reasonable upper bounds for nutrition values
-                    max_values = {
-                        'calories': 5000,
-                        'protein': 500,
-                        'carbs': 1000,
-                        'carbohydrates': 1000,
-                        'fat': 300,
-                        'fiber': 100,
-                        'sugar': 200,
-                        'sodium': 10000
-                    }
-                    
-                    if field in max_values and rounded_value > max_values[field]:
-                        raise serializers.ValidationError(
-                            f"{field} value {rounded_value} seems unreasonably high (max: {max_values[field]})"
-                        )
-                    
-                    attrs[field] = rounded_value
-        
-        # Cross-field validation
+        # Cross-field validation for carbs/carbohydrates consistency
         if 'carbs' in attrs and 'carbohydrates' in attrs:
             if attrs['carbs'] is not None and attrs['carbohydrates'] is not None:
                 if abs(attrs['carbs'] - attrs['carbohydrates']) > 0.1:

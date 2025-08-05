@@ -519,22 +519,23 @@ class AIService:
             # Parse the JSON response and generate detailed recipes
             meal_plan_data = await self._parse_meal_plan_response(response_text, user)
             
-            # Get the processed daily meals (already formatted for iOS compatibility)
-            processed_daily_meals = meal_plan_data.get('weeklyMealPlan', [])
+            # Get the processed lightweight daily meals (RecipeStub format)
+            processed_lightweight_meals = meal_plan_data.get('lightweightMealPlan', [])
             
-            # Create the final meal plan structure
+            # Create the final meal plan structure with lightweight format
             meal_plan = {
                 'id': f'ai-generated-{user.id}-{datetime.now().strftime("%Y%m%d%H%M%S")}',
                 'user_id': str(user.id),
                 'name': f'AI Generated Plan - {datetime.now().strftime("%Y-%m-%d")}',
-                'description': 'AI-generated healthy meal plan',
+                'description': 'AI-generated lightweight meal plan with recipe suggestions',
                 'week_start_date': request.week_start_date or date.today(),
                 'is_active': False,
                 'plan_description': request.plan_description,
                 'analysis_text': self._generate_analysis_text(request),
-                'items': None,  # AI generated plans don't have items initially
+                'items': None,  # No items initially for lightweight plans
                 'items_count': 0,
-                'daily_meals': processed_daily_meals,
+                'daily_meals': None,  # No full recipes in lightweight mode
+                'lightweight_daily_meals': processed_lightweight_meals,  # RecipeStub format
                 'created_at': datetime.now(),
                 'updated_at': datetime.now()
             }
@@ -620,6 +621,198 @@ class AIService:
                 'error': f'Failed to generate recipe details: {str(e)}'
             }
     
+    async def apply_meal_to_plan(self, recipe_stub: Dict[str, Any], user, meal_plan_id: str = None, day_of_week: int = 0, meal_type: str = 'lunch', serving_size: float = 1.0, save_to_account: bool = True) -> Dict[str, Any]:
+        """
+        Convert a RecipeStub to a complete Recipe and optionally add to meal plan.
+        This is the second phase of the lightweight meal plan system.
+        """
+        try:
+            self.logger.info(f"Applying meal to plan for user {user.id}: {recipe_stub.get('name', 'Unknown')}")
+            
+            # Extract recipe stub data
+            recipe_name = recipe_stub.get('name', '')
+            if not recipe_name.strip():
+                raise ValueError("Recipe name is required")
+            
+            # Check if this recipe already exists in database
+            existing_recipe = None
+            if recipe_stub.get('id'):
+                from apps.recipes.models import Recipe
+                try:
+                    existing_recipe = await asyncio.to_thread(
+                        Recipe.objects.get, 
+                        id=recipe_stub['id']
+                    )
+                    self.logger.info(f"Found existing recipe with ID: {recipe_stub['id']}")
+                except Recipe.DoesNotExist:
+                    pass
+            
+            # If recipe doesn't exist, generate it using AI
+            if not existing_recipe:
+                self.logger.info(f"Generating detailed recipe for: {recipe_name}")
+                
+                # Create recipe generation request with enhanced context from stub
+                recipe_request = RecipeGenerationRequest(
+                    name=recipe_name,
+                    description=recipe_stub.get('description', ''),
+                    cuisine=recipe_stub.get('cuisine', ''),
+                    prep_time=recipe_stub.get('estimated_prep_time'),
+                    cook_time=None,  # Will be estimated by AI
+                    meal_type=meal_type
+                )
+                
+                # Generate detailed recipe using existing AI service
+                recipe_result = await self.generate_recipe_details(recipe_request, user)
+                
+                if not recipe_result.get('success'):
+                    raise Exception(f"Failed to generate recipe details: {recipe_result.get('error', 'Unknown error')}")
+                
+                recipe_data = recipe_result['recipe']
+            else:
+                # Use existing recipe data
+                recipe_data = {
+                    'id': str(existing_recipe.id),
+                    'name': existing_recipe.name,
+                    'description': existing_recipe.description,
+                    'cuisine': existing_recipe.cuisine,
+                    'difficulty': existing_recipe.difficulty,
+                    'prep_time': existing_recipe.prep_time,
+                    'cook_time': existing_recipe.cook_time,
+                    'image_url': existing_recipe.image_url,
+                    'ingredients': [
+                        {'name': ing.name, 'amount': ing.amount}
+                        for ing in existing_recipe.ingredients.all()
+                    ],
+                    'instructions': existing_recipe.instructions,
+                    'nutrition_info': existing_recipe.nutrition_info or {},
+                    'tags': existing_recipe.tags or [],
+                    'avg_rating': float(existing_recipe.avg_rating or 0),
+                    'rating_count': existing_recipe.rating_count or 0,
+                    'created_by_user': existing_recipe.created_by_user,
+                    'created_by_user_id': str(existing_recipe.created_by_user_id),
+                    'created_at': existing_recipe.created_at.isoformat(),
+                    'updated_at': existing_recipe.updated_at.isoformat()
+                }
+            
+            # If save_to_account is True, save the recipe to user's account
+            saved_recipe = None
+            if save_to_account and not existing_recipe:
+                from apps.ai_integration.serializers import CreateRecipeFromAISerializer
+                from apps.ai_integration.views import create_recipe_from_ai
+                
+                # Create recipe from AI data
+                create_request = {
+                    'ai_recipe_data': recipe_data,
+                    'save_to_account': True
+                }
+                
+                # This is a bit circular, but we need to call the existing recipe creation logic
+                # TODO: Refactor to extract the recipe creation logic into a separate service method
+                
+            # If meal_plan_id is provided, add the recipe to the meal plan
+            meal_plan_item = None
+            if meal_plan_id:
+                from apps.meal_plans.models import MealPlan, MealPlanItem
+                from apps.recipes.models import Recipe
+                
+                try:
+                    # Get the meal plan
+                    meal_plan = await asyncio.to_thread(
+                        MealPlan.objects.get, 
+                        id=meal_plan_id, 
+                        user=user
+                    )
+                    
+                    # Get or create the recipe
+                    if existing_recipe:
+                        recipe_obj = existing_recipe
+                    else:
+                        # Create recipe in database if it doesn't exist
+                        recipe_obj = await asyncio.to_thread(self._create_recipe_from_data, recipe_data, user)
+                    
+                    # Create meal plan item
+                    meal_plan_item_data = {
+                        'meal_plan': meal_plan,
+                        'recipe': recipe_obj,
+                        'day_of_week': day_of_week,
+                        'meal_type': meal_type,
+                        'serving_size': serving_size
+                    }
+                    
+                    meal_plan_item = await asyncio.to_thread(
+                        MealPlanItem.objects.create, 
+                        **meal_plan_item_data
+                    )
+                    
+                    self.logger.info(f"Added recipe to meal plan: {meal_plan_id}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error adding recipe to meal plan: {str(e)}")
+                    # Don't fail the entire operation if meal plan addition fails
+                    pass
+            
+            # Prepare response
+            result = {
+                'success': True,
+                'recipe': recipe_data,
+                'message': f'Successfully created recipe: {recipe_name}'
+            }
+            
+            if meal_plan_item:
+                result['meal_plan_item'] = {
+                    'id': meal_plan_item.id,
+                    'meal_plan_id': str(meal_plan_item.meal_plan_id),
+                    'recipe_id': str(meal_plan_item.recipe_id),
+                    'day_of_week': meal_plan_item.day_of_week,
+                    'meal_type': meal_plan_item.meal_type,
+                    'serving_size': float(meal_plan_item.serving_size),
+                    'added_at': meal_plan_item.added_at.isoformat()
+                }
+                result['message'] += f' and added to meal plan'
+            
+            self.logger.info(f"Successfully applied meal for user {user.id}")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error applying meal to plan for user {user.id}: {str(e)}", exc_info=True)
+            return {
+                'success': False,
+                'error': f'Failed to apply meal to plan: {str(e)}'
+            }
+    
+    def _create_recipe_from_data(self, recipe_data: Dict[str, Any], user) -> 'Recipe':
+        """Create a Recipe model instance from recipe data."""
+        from apps.recipes.models import Recipe, Ingredient as RecipeIngredient
+        
+        # Create the recipe
+        recipe = Recipe.objects.create(
+            name=recipe_data['name'],
+            description=recipe_data.get('description', ''),
+            cuisine=recipe_data.get('cuisine', ''),
+            difficulty=recipe_data.get('difficulty', 'medium'),
+            prep_time=recipe_data.get('prep_time', 30),
+            cook_time=recipe_data.get('cook_time', 30),
+            image_url=recipe_data.get('image_url', ''),
+            instructions=recipe_data.get('instructions', []),
+            nutrition_info=recipe_data.get('nutrition_info', {}),
+            tags=recipe_data.get('tags', []),
+            created_by_user=user,
+            avg_rating=recipe_data.get('avg_rating', 0.0),
+            rating_count=recipe_data.get('rating_count', 0)
+        )
+        
+        # Create ingredients
+        for ingredient_data in recipe_data.get('ingredients', []):
+            RecipeIngredient.objects.create(
+                recipe=recipe,
+                name=ingredient_data.get('name', ''),
+                amount=ingredient_data.get('amount', ''),
+                unit='',
+                notes=''
+            )
+        
+        return recipe
+    
     async def analyze_meal_plan(self, meal_plan, plan_description: str = '', analysis_type: str = 'full') -> Dict[str, Any]:
         """
         Analyze a meal plan for nutrition, variety, and balance using Google Gemini AI.
@@ -697,20 +890,21 @@ class AIService:
         if request.additional_requirements:
             additional_text = f"\n额外要求: {request.additional_requirements}"
         
-        return f"""你是一位专业的膳食计划AI。根据用户描述生成7天膳食计划，只需要食谱名称和基本信息。
+        return f"""你是一位专业的膳食计划AI。根据用户描述生成7天轻量化膳食计划，只包含食谱的基本预览信息。
 输出必须是有效的JSON对象，所有文本内容用中文。
 
 用户计划描述: {request.plan_description}{dietary_preferences_text}{allergies_text}{dislikes_text}{calorie_text}{additional_text}
 
 要求：
-1. 只生成食谱名称和基本信息，不需要详细配料和步骤
+1. 只生成食谱的基本预览信息，不需要详细配料和步骤
 2. 所有内容用中文
 3. 食谱名称要具体且有吸引力
 4. 考虑营养均衡和多样性
+5. 提供预估的卡路里和准备时间
 
 输出JSON格式：
 {{
-  "weeklyMealPlan": [
+  "lightweightMealPlan": [
     {{
       "day": "星期一",
       "breakfast": [食谱基本信息数组],
@@ -721,23 +915,31 @@ class AIService:
   ]
 }}
 
-每个食谱对象只需包含：
+每个食谱对象必须包含以下字段（RecipeStub格式）：
 {{
+  "id": null,
   "name": "具体的食谱名称，如'香煎三文鱼配柠檬芦笋'",
-  "description": "简短描述，15-20字",
   "cuisine": "菜系，如'中式'、'西式'、'日式'等",
-  "meal_type": "breakfast/lunch/dinner"
+  "description": "简短描述，15-25字",
+  "estimated_calories": 300,
+  "estimated_prep_time": 20,
+  "image_url": null,
+  "tags": ["健康", "低脂", "快手菜"]
 }}
 
-重要：
+重要说明：
 - 确保JSON语法正确
 - 每天包含早餐、午餐、晚餐
 - 每餐通常1个食谱，特殊情况可以2个
 - 食谱名称要具体，不要太笼统
 - 一周内避免重复食谱
 - 考虑营养搭配和口味多样性
+- estimated_calories：预估每份卡路里（100-800）
+- estimated_prep_time：预估准备时间（5-60分钟）
+- tags：相关标签数组，如["健康", "素食", "快手菜", "高蛋白"]
+- id 和 image_url 字段设为 null（将在后续 applyMeal 时生成）
 
-请生成完整的7天膳食计划JSON。
+请生成完整的7天轻量化膳食计划JSON。
 确保您的整个响应是一个以 {{ 开始并以 }} 结束的JSON对象。"""
 
     def _build_recipe_details_prompt(self, request: RecipeGenerationRequest) -> str:
@@ -825,7 +1027,7 @@ class AIService:
 确保输出格式为有效的JSON。"""
 
     async def _parse_meal_plan_response(self, response_text: str, user) -> Dict[str, Any]:
-        """Parse the meal plan response from Gemini and generate detailed recipes using batch processing."""
+        """Parse the lightweight meal plan response from Gemini and return RecipeStub format."""
         try:
             # Clean up the response text
             response_text = response_text.strip()
@@ -863,83 +1065,42 @@ class AIService:
                     self.logger.error(f"Failed to fix JSON syntax: {str(fix_error)}")
                     raise Exception("Invalid JSON response from AI model")
             
-            # Validate and clean the data
-            if 'weeklyMealPlan' in data and isinstance(data['weeklyMealPlan'], list):
+            # Validate and clean the lightweight meal plan data
+            if 'lightweightMealPlan' in data and isinstance(data['lightweightMealPlan'], list):
                 # Ensure we have 7 days
-                if len(data['weeklyMealPlan']) == 7:
-                    # Collect all recipe generation requests for batch processing
-                    recipe_requests = []
-                    day_meal_mapping = []  # Track which day/meal each recipe belongs to
+                if len(data['lightweightMealPlan']) == 7:
+                    self.logger.info(f"Processing lightweight meal plan with RecipeStub format")
                     
-                    for day_idx, day_plan in enumerate(data['weeklyMealPlan']):
+                    for day_idx, day_plan in enumerate(data['lightweightMealPlan']):
                         if not isinstance(day_plan, dict):
                             continue
                         
-                        # Process each meal type
+                        # Process each meal type and validate RecipeStub format
                         for meal_type in ['breakfast', 'lunch', 'dinner']:
                             if meal_type not in day_plan:
                                 day_plan[meal_type] = []
                             elif not isinstance(day_plan[meal_type], list):
                                 day_plan[meal_type] = []
                             else:
-                                # Filter valid basic recipes
-                                valid_basic_recipes = [
-                                    meal for meal in day_plan[meal_type]
-                                    if (isinstance(meal, dict) and 
-                                        'name' in meal and 
-                                        isinstance(meal['name'], str) and
-                                        meal['name'].strip())
-                                ]
+                                # Validate and clean RecipeStub objects
+                                valid_recipe_stubs = []
+                                for recipe_stub in day_plan[meal_type]:
+                                    if (isinstance(recipe_stub, dict) and 
+                                        'name' in recipe_stub and 
+                                        isinstance(recipe_stub['name'], str) and
+                                        recipe_stub['name'].strip()):
+                                        
+                                        # Clean and validate RecipeStub fields
+                                        cleaned_stub = self._clean_recipe_stub(recipe_stub)
+                                        valid_recipe_stubs.append(cleaned_stub)
                                 
-                                # Add to batch processing list
-                                for basic_recipe in valid_basic_recipes:
-                                    recipe_requests.append((basic_recipe, meal_type, user))
-                                    day_meal_mapping.append((day_idx, meal_type))
+                                day_plan[meal_type] = valid_recipe_stubs
                     
-                    # Generate all recipes concurrently using batch processing
-                    self.logger.info(f"Processing {len(recipe_requests)} recipes using batch generation")
-                    
-                    if recipe_requests:
-                        detailed_recipes = await self._generate_recipes_batch(recipe_requests)
-                        
-                        # Map the generated recipes back to their respective days and meals
-                        recipe_index = 0
-                        for day_idx, day_plan in enumerate(data['weeklyMealPlan']):
-                            if not isinstance(day_plan, dict):
-                                continue
-                                
-                            for meal_type in ['breakfast', 'lunch', 'dinner']:
-                                if meal_type in day_plan and isinstance(day_plan[meal_type], list):
-                                    valid_basic_recipes = [
-                                        meal for meal in day_plan[meal_type]
-                                        if (isinstance(meal, dict) and 
-                                            'name' in meal and 
-                                            isinstance(meal['name'], str) and
-                                            meal['name'].strip())
-                                    ]
-                                    
-                                    # Replace with detailed recipes
-                                    meal_detailed_recipes = []
-                                    for _ in valid_basic_recipes:
-                                        if recipe_index < len(detailed_recipes):
-                                            meal_detailed_recipes.append(detailed_recipes[recipe_index])
-                                            recipe_index += 1
-                                    
-                                    day_plan[meal_type] = meal_detailed_recipes
-                                else:
-                                    day_plan[meal_type] = []
-                    else:
-                        # No valid recipes found, ensure empty arrays
-                        for day_plan in data['weeklyMealPlan']:
-                            if isinstance(day_plan, dict):
-                                for meal_type in ['breakfast', 'lunch', 'dinner']:
-                                    day_plan[meal_type] = []
-                    
-                    return data
+                    return {'lightweightMealPlan': data['lightweightMealPlan']}
             
-            # If validation fails, return empty structure
+            # If validation fails, return empty lightweight structure
             return {
-                'weeklyMealPlan': [
+                'lightweightMealPlan': [
                     {
                         'day': day,
                         'breakfast': [],
@@ -955,6 +1116,42 @@ class AIService:
             self.logger.error(f"Error parsing meal plan response ({exception_type}): {str(e)}")
             raise
     
+    def _clean_recipe_stub(self, recipe_stub: Dict[str, Any]) -> Dict[str, Any]:
+        """Clean and validate RecipeStub fields."""
+        cleaned = {
+            'id': recipe_stub.get('id'),  # Should be null for AI-generated
+            'name': recipe_stub.get('name', '').strip(),
+            'cuisine': recipe_stub.get('cuisine', '国际').strip(),
+            'description': recipe_stub.get('description', '').strip(),
+            'estimated_calories': recipe_stub.get('estimated_calories'),
+            'estimated_prep_time': recipe_stub.get('estimated_prep_time'),
+            'image_url': recipe_stub.get('image_url'),  # Should be null initially
+            'tags': recipe_stub.get('tags', [])
+        }
+        
+        # Validate and clean numeric fields
+        if cleaned['estimated_calories'] is not None:
+            try:
+                cleaned['estimated_calories'] = max(0, min(5000, int(cleaned['estimated_calories'])))
+            except (ValueError, TypeError):
+                cleaned['estimated_calories'] = None
+        
+        if cleaned['estimated_prep_time'] is not None:
+            try:
+                cleaned['estimated_prep_time'] = max(0, min(480, int(cleaned['estimated_prep_time'])))
+            except (ValueError, TypeError):
+                cleaned['estimated_prep_time'] = None
+        
+        # Ensure tags is a list
+        if not isinstance(cleaned['tags'], list):
+            cleaned['tags'] = []
+        
+        # Generate fallback description if missing
+        if not cleaned['description']:
+            cleaned['description'] = f"美味的{cleaned['name']}"
+        
+        return cleaned
+
     def _create_smart_fallback_recipe(self, basic_recipe: Dict[str, Any], meal_type: str) -> Dict[str, Any]:
         """Create an intelligent fallback recipe based on recipe name analysis."""
         recipe_name = basic_recipe.get('name', 'Unknown Recipe')
