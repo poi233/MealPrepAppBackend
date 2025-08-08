@@ -599,7 +599,7 @@ class AIService:
                 'image_url': image_url,
                 'ingredients': recipe_data.get('ingredients', []),  # List of {name, amount} objects
                 'instructions': recipe_data.get('instructions', []),  # List of strings
-                'nutrition_info': self._generate_mock_nutrition(),  # Keep mock for now
+                'nutrition_info': recipe_data.get('nutrition_info', self._generate_mock_nutrition()),  # Use AI-generated nutrition or fallback
                 'tags': recipe_data.get('tags', self._generate_tags(request))  # Use AI-generated tags or fallback
             }
                         
@@ -944,7 +944,7 @@ class AIService:
 
     def _build_recipe_details_prompt(self, request: RecipeGenerationRequest) -> str:
         """Build the prompt for recipe details generation."""
-        return f"""你是一位专业的烹饪助手。根据给定的食谱名称，提供完整的食谱信息。请用中文回答。
+        return f"""你是一位专业的烹饪助手和营养师。根据给定的食谱名称，提供完整的食谱信息，包括精确的营养分析。请用中文回答。
 
 食谱名称: {request.name}
 
@@ -957,6 +957,7 @@ class AIService:
 6. 根据食谱复杂程度自动判断难度等级（简单、中等、困难）
 7. 估算合理的准备时间和烹饪时间（分钟）
 8. 生成适合的标签（如素食、低脂、高蛋白、快手菜等）
+9. **重要**：根据配料的实际营养成分，准确计算营养信息（卡路里、蛋白质、碳水化合物、脂肪等）
 
 字段要求：
 - description: 简短的食谱描述（20-30字）
@@ -967,6 +968,7 @@ class AIService:
 - pexels_query: 用于Pexels图片搜索的英文关键词，要简洁且准确描述这道菜的视觉特征（如"chinese braised pork belly"、"italian pasta carbonara"、"japanese sushi rolls"等）
 - ingredients: 配料列表，每个配料包含name和amount字段
 - instructions: 烹饪步骤列表，每个步骤为独立字符串，不需要标出数字顺序但是应符合在数组中的顺序
+- nutrition_info: 营养信息对象，基于实际配料计算得出（一人份）
 - tags: 标签数组，包含相关特征标签
 
 请严格按照以下JSON格式输出：
@@ -993,10 +995,35 @@ class AIService:
     "加入生抽调色调味，继续炒制2分钟至鸡肉完全熟透",
     "盛起装盘，搭配米饭一起享用"
   ],
+  "nutrition_info": {{
+    "calories": 520,
+    "protein": "35g",
+    "carbohydrates": "65g",
+    "fat": "8g",
+    "fiber": "2g",
+    "sodium": "680mg",
+    "sugar": "1g",
+    "servings": 1
+  }},
   "tags": ["家常菜", "高蛋白", "下饭菜", "营养丰富"]
 }}
 
-请为"{request.name}"提供一个营养均衡的、一人份的完整食谱信息。确保所有字段都包含在JSON中，并且格式正确。"""
+营养信息计算说明：
+- calories: 总卡路里数（基于所有配料的热量相加）
+- protein: 蛋白质含量（克）
+- carbohydrates: 碳水化合物含量（克）
+- fat: 脂肪含量（克）
+- fiber: 膳食纤维含量（克）
+- sodium: 钠含量（毫克，包括食盐和调料中的钠）
+- sugar: 糖分含量（克）
+- servings: 份数（固定为1，表示一人份）
+
+请根据实际配料的营养成分，仔细计算营养信息。例如：
+- 150克鸡胸肉约含 231卡路里，43.5克蛋白质，0克碳水化合物，5克脂肪
+- 80克大米约含 288卡路里，6.4克蛋白质，64克碳水化合物，0.6克脂肪
+- 调料和油类也要计算在内
+
+请为"{request.name}"提供一个营养均衡的、一人份的完整食谱信息，包括基于真实配料的准确营养分析。确保所有字段都包含在JSON中，并且格式正确。"""
 
     def _build_meal_plan_analysis_prompt(self, plan_description: str, meal_plan_data: str) -> str:
         """Build the prompt for meal plan analysis."""
@@ -1532,7 +1559,27 @@ class AIService:
             if 'pexels_query' in data and not isinstance(data['pexels_query'], str):
                 raise Exception("Invalid pexels_query field - must be a string")
             
-
+            # Validate nutrition_info field (optional, will use default if missing)
+            if 'nutrition_info' in data:
+                if not isinstance(data['nutrition_info'], dict):
+                    raise Exception("Invalid nutrition_info field - must be an object")
+                
+                # Validate required nutrition fields
+                required_nutrition_fields = ['calories', 'protein', 'carbohydrates', 'fat', 'servings']
+                for field in required_nutrition_fields:
+                    if field in data['nutrition_info']:
+                        if field == 'servings':
+                            # servings should be a number
+                            if not isinstance(data['nutrition_info'][field], (int, float)):
+                                raise Exception(f"Invalid nutrition_info.{field} field - must be a number")
+                        elif field == 'calories':
+                            # calories should be a number
+                            if not isinstance(data['nutrition_info'][field], (int, float)):
+                                raise Exception(f"Invalid nutrition_info.{field} field - must be a number")
+                        else:
+                            # other nutrition fields can be strings (e.g., "25g") or numbers
+                            if not isinstance(data['nutrition_info'][field], (str, int, float)):
+                                raise Exception(f"Invalid nutrition_info.{field} field - must be a string or number")
             
             # Validate tags field (optional, will use default if missing)
             if 'tags' in data:
