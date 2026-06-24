@@ -199,7 +199,7 @@ CORS_ALLOW_CREDENTIALS = True
 
 # AI Integration Settings
 GOOGLE_API_KEY = config('GEMINI_API_KEY')
-GENAI_MODEL = 'gemini-2.0-flash-lite'
+GENAI_MODEL = config('GENAI_MODEL', default='gemini-flash-latest')
 
 # Pexels API Settings
 PEXELS_API_KEY = config('PEXELS_API_KEY', default=None)
